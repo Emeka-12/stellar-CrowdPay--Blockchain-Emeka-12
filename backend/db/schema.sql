@@ -43,7 +43,7 @@ CREATE TABLE campaigns (
   asset_type          TEXT NOT NULL CHECK (asset_type IN ('XLM', 'USDC')),
   wallet_public_key   TEXT UNIQUE NOT NULL,
   status              TEXT NOT NULL DEFAULT 'active'
-                        CHECK (status IN ('active', 'funded', 'in_progress', 'completed', 'closed', 'withdrawn', 'failed')),
+                        CHECK (status IN ('active', 'funded', 'in_progress', 'completed', 'closed', 'withdrawn', 'failed', 'suspended', 'refunded')),
   deadline            DATE,
   show_backer_amounts BOOLEAN DEFAULT TRUE,
   category            TEXT CHECK (category IN (
@@ -103,7 +103,7 @@ CREATE TABLE withdrawal_requests (
   creator_signed      BOOLEAN DEFAULT FALSE,
   platform_signed     BOOLEAN DEFAULT FALSE,
   status              TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'submitted', 'failed', 'denied')),
+                        CHECK (status IN ('pending', 'creator_signed', 'platform_signed', 'submitted', 'failed', 'denied', 'cancelled')),
   denial_reason       TEXT,
   tx_hash             TEXT,
   created_at          TIMESTAMPTZ DEFAULT NOW()

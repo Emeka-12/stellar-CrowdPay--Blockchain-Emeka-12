@@ -1,12 +1,69 @@
 const router = require("express").Router();
+const sanitizeHtml = require("sanitize-html");
 const db = require("../config/database");
 const { requireAuth } = require("../middleware/auth");
 const asyncHandler = require("../utils/asyncHandler");
 
-function cleanText(value = "") {
-  return String(value)
-    .replace(/<[^>]*>/g, "")
+const MAX_BODY_LENGTH = 20000;
+const MAX_TITLE_LENGTH = 200;
+
+const SANITIZE_OPTIONS = {
+  allowedTags: [
+    "p",
+    "br",
+    "strong",
+    "b",
+    "em",
+    "i",
+    "u",
+    "s",
+    "ul",
+    "ol",
+    "li",
+    "blockquote",
+    "code",
+    "pre",
+    "a",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+  ],
+  allowedAttributes: {
+    a: ["href", "title", "target", "rel"],
+  },
+  allowedSchemes: ["http", "https", "mailto"],
+  transformTags: {
+    a: sanitizeHtml.simpleTransform("a", {
+      rel: "noopener noreferrer nofollow",
+      target: "_blank",
+    }),
+  },
+};
+
+function sanitizeText(value = "") {
+  return sanitizeHtml(String(value), SANITIZE_OPTIONS).trim();
+}
+
+function sanitizeTitle(value = "") {
+  // Titles are plain text: strip all tags and collapse whitespace.
+  return sanitizeHtml(String(value), { allowedTags: [], allowedAttributes: {} })
+    .replace(/\s+/g, " ")
     .trim();
+}
+
+function withVariants(row) {
+  if (!row) return row;
+  return {
+    ...row,
+    title_raw: row.title,
+    title_sanitized: row.title,
+    body_raw: row.body,
+    body_sanitized: row.body,
+  };
 }
 
 async function requireCampaignCreator(req, res, next) {
@@ -51,7 +108,7 @@ router.get(
       [req.params.id],
     );
 
-    res.json(rows);
+    res.json(rows.map(withVariants));
   }),
 );
 
@@ -61,8 +118,22 @@ router.post(
   requireAuth,
   requireCampaignCreator,
   asyncHandler(async (req, res) => {
-    const title = cleanText(req.body.title);
-    const body = cleanText(req.body.body);
+    const rawTitle = String(req.body.title ?? "");
+    const rawBody = String(req.body.body ?? "");
+
+    if (rawBody.length > MAX_BODY_LENGTH) {
+      return res.status(422).json({
+        error: `Body must be at most ${MAX_BODY_LENGTH} characters`,
+      });
+    }
+    if (rawTitle.length > MAX_TITLE_LENGTH) {
+      return res.status(422).json({
+        error: `Title must be at most ${MAX_TITLE_LENGTH} characters`,
+      });
+    }
+
+    const title = sanitizeTitle(rawTitle);
+    const body = sanitizeText(rawBody);
 
     if (!title) return res.status(422).json({ error: "Title is required" });
     if (!body) return res.status(422).json({ error: "Body is required" });
@@ -74,7 +145,7 @@ router.post(
       [req.params.id, req.user.userId, title, body],
     );
 
-    res.status(201).json(rows[0]);
+    res.status(201).json(withVariants(rows[0]));
   }),
 );
 
@@ -84,8 +155,22 @@ router.patch(
   requireAuth,
   requireCampaignCreator,
   asyncHandler(async (req, res) => {
-    const title = cleanText(req.body.title);
-    const body = cleanText(req.body.body);
+    const rawTitle = String(req.body.title ?? "");
+    const rawBody = String(req.body.body ?? "");
+
+    if (rawBody.length > MAX_BODY_LENGTH) {
+      return res.status(422).json({
+        error: `Body must be at most ${MAX_BODY_LENGTH} characters`,
+      });
+    }
+    if (rawTitle.length > MAX_TITLE_LENGTH) {
+      return res.status(422).json({
+        error: `Title must be at most ${MAX_TITLE_LENGTH} characters`,
+      });
+    }
+
+    const title = sanitizeTitle(rawTitle);
+    const body = sanitizeText(rawBody);
 
     if (!title) return res.status(422).json({ error: "Title is required" });
     if (!body) return res.status(422).json({ error: "Body is required" });
@@ -109,7 +194,7 @@ router.patch(
       });
     }
 
-    res.json(rows[0]);
+    res.json(withVariants(rows[0]));
   }),
 );
 

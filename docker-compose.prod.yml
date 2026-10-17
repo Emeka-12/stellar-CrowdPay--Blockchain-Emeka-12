@@ -27,3 +27,40 @@ services:
       - "80:80"
     depends_on: [backend]
     restart: unless-stopped
+
+  # Nightly encrypted logical backup of the production Postgres.
+  # See backend/docs/backup-restore.md for the full runbook and restore drill.
+  backup:
+    image: postgres:15-alpine
+    env_file: ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - pgbackups:/backups
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-crowdpay}
+      PGUSER: ${POSTGRES_USER:-crowdpay}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_ENCRYPTION_PASSPHRASE: ${BACKUP_ENCRYPTION_PASSPHRASE}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "Backup sidecar started; running nightly at 02:00 UTC"
+        while true; do
+          now=$$(date -u +%s)
+          next=$$(date -u -d 'tomorrow 02:00' +%s)
+          sleep $$((next - now))
+          /usr/local/bin/backup.sh || echo "Backup run failed at $$(date -u)"
+        done
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  pgbackups:
