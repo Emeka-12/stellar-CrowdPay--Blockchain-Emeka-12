@@ -31,13 +31,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version-file: backend/.nvmrc
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
       - name: Install dependencies
         working-directory: ./backend
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run linter
         working-directory: ./backend
@@ -129,11 +129,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version-file: backend/.nvmrc
 
       - name: Install backend dependencies
         working-directory: ./backend
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Install frontend dependencies
         working-directory: ./frontend
