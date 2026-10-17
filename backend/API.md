@@ -176,6 +176,7 @@ Deprecated aliases still respond but will be removed; new integrations must use 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | `GET` | `/api/admin/stats` | Admin | |
+| `GET` | `/api/admin/metrics/db-pool` | Admin | Database pool total/idle/waiting counts |
 | `GET` | `/api/admin/campaigns` | Admin | |
 | `GET` | `/api/admin/campaigns/deleted` | Admin | |
 | `PATCH` | `/api/admin/campaigns/:id/suspend` | Admin | |
@@ -219,7 +220,7 @@ Deprecated aliases still respond but will be removed; new integrations must use 
 |---|---|---|---|
 | `GET` | `/api/config` | Public | `{ platform_fee_bps }` |
 | `GET` | `/api/stats` | Public | Landing-page totals (cached 60 s) |
-| `GET` | `/health` | Public | Database connectivity |
+| `GET` | `/health` | Public | Liveness + database connectivity; returns `{ "status": "ok" }` |
 | `GET` | `/health/ledger` | Public | Horizon stream health |
 
 ### Removed

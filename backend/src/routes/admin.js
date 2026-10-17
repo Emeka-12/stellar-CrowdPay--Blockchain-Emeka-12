@@ -51,6 +51,18 @@ router.get('/stats', async (req, res) => {
 });
 
 /**
+ * GET /api/admin/metrics/db-pool
+ * Database connection pool metrics
+ */
+router.get('/metrics/db-pool', (req, res) => {
+  res.json({
+    total: db.totalCount,
+    idle: db.idleCount,
+    waiting: db.waitingCount,
+  });
+});
+
+/**
  * GET /api/admin/campaigns
  * List all campaigns with filters
  */

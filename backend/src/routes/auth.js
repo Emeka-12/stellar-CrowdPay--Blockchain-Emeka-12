@@ -104,7 +104,7 @@ function setRefreshTokenCookie(res, token, expiresAt) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    sameSite: 'strict',
     maxAge: REFRESH_TOKEN_COOKIE_MAX_AGE,
     expires: expiresAt,
   });
@@ -114,7 +114,7 @@ function clearRefreshTokenCookie(res) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, '', {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    sameSite: 'strict',
     maxAge: 0,
     expires: new Date(0),
   });
