@@ -1,9 +1,15 @@
 const crypto = require('crypto');
+const express = require('express');
 const router = require('express').Router();
 const db = require('../config/database');
 const { requireAuth } = require('../middleware/auth');
 const { ALL_WEBHOOK_EVENTS } = require('../services/webhookDispatcher');
 const { extractWebhookResult } = require('../services/kycProvider');
+
+// #280 — Per-route JSON body limit for webhook admin payloads (registration,
+// echo, etc.). Kept tight so oversized payloads fail fast with a 413 instead
+// of relying on the global parser limit.
+const webhookJsonParser = express.json({ limit: '10kb' });
 
 function isValidWebhookUrl(urlString) {
   try {
@@ -131,7 +137,7 @@ router.get('/', requireAuth, async (req, res) => {
   res.json(rows);
 });
 
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, webhookJsonParser, async (req, res) => {
   const { url, events } = req.body || {};
   if (!url || !events) {
     return res.status(400).json({ error: 'url and events array are required' });

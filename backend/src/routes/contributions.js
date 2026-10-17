@@ -493,6 +493,9 @@ router.post('/submit-signed', requireAuth, submitSignedLimiter, asyncHandler(asy
       error: err.message,
     });
     sendAlert('Freighter contribution submission failed', {
+      alert_key: 'contribution.freighter_submission_failed',
+      fingerprint: `${prepared.campaign_id}:${err.name || 'Error'}`,
+      severity: 'critical',
       campaign_id: prepared.campaign_id,
       error: err.message,
     });

@@ -1,3 +1,4 @@
+const express = require('express');
 const router = require('express').Router();
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
@@ -113,7 +114,7 @@ const requireCampaignMember = (...allowedRoles) => {
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 20 },
   fileFilter: (_req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp'];
     if (!allowed.includes(file.mimetype)) {
@@ -126,6 +127,10 @@ const upload = multer({
 const SUPPORTED_ASSETS = getSupportedAssetCodes();
 const MILESTONE_PERCENT_SCALE = 10000;
 const MILESTONE_LIMIT = 5;
+
+// Text-heavy campaign routes accept markdown/description bodies; cap them tighter
+// than the global JSON limit so oversized payloads fail fast with a 413.
+const campaignBodyParser = express.json({ limit: '10kb' });
 
 const isTest = process.env.NODE_ENV === 'test';
 
@@ -726,7 +731,7 @@ router.post('/:id/trigger-refunds', requireAuth, requireRole('admin'), asyncHand
 }));
 
 // Create campaign (authenticated)
-router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignValidation, validateRequest, asyncHandler(async (req, res) => {
+router.post('/', campaignBodyParser, requireAuth, requireRole('creator', 'admin'), createCampaignValidation, validateRequest, asyncHandler(async (req, res) => {
   /**
    * @openapi
    * /api/campaigns:
@@ -859,7 +864,7 @@ router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignVal
 }));
 
 // PATCH /campaigns/:id - Update campaign (title, description, deadline)
-router.patch('/:id', requireAuth, asyncHandler(async (req, res) => {
+router.patch('/:id', campaignBodyParser, requireAuth, asyncHandler(async (req, res) => {
   const campaignId = req.params.id;
   const { title, description, deadline } = req.body;
 

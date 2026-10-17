@@ -1,9 +1,13 @@
-const router = require('express').Router();
+const express = require('express');
+const router = express.Router();
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { reconcileSingleCampaign } = require('../services/reconciliation');
 const cache = require('../utils/cache');
+
+// Per-route JSON body limit for admin payloads (tighter than the global limit).
+const adminJsonParser = express.json({ limit: '10kb' });
 
 router.use(requireAuth);
 router.use(requireAdmin);
@@ -114,7 +118,7 @@ router.get('/campaigns/deleted', async (req, res) => {
  * PATCH /api/admin/campaigns/:id/suspend
  * Suspend a campaign (prevent new contributions)
  */
-router.patch('/campaigns/:id/suspend', async (req, res) => {
+router.patch('/campaigns/:id/suspend', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
@@ -154,7 +158,7 @@ router.patch('/campaigns/:id/suspend', async (req, res) => {
  * PATCH /api/admin/campaigns/:id/restore
  * Restore a suspended campaign to active, or restore a soft-deleted campaign
  */
-router.patch('/campaigns/:id/restore', async (req, res) => {
+router.patch('/campaigns/:id/restore', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -214,7 +218,7 @@ router.patch('/campaigns/:id/restore', async (req, res) => {
  * DELETE /api/admin/campaigns/:id
  * Soft-delete (archive) a campaign
  */
-router.delete('/campaigns/:id', async (req, res) => {
+router.delete('/campaigns/:id', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
@@ -251,7 +255,7 @@ router.delete('/campaigns/:id', async (req, res) => {
  * PATCH /api/admin/campaigns/:id/feature
  * Mark a campaign as featured
  */
-router.patch('/campaigns/:id/feature', async (req, res) => {
+router.patch('/campaigns/:id/feature', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
     const { note } = req.body;
@@ -289,7 +293,7 @@ router.patch('/campaigns/:id/feature', async (req, res) => {
  * PATCH /api/admin/campaigns/:id/unfeature
  * Remove featured status from a campaign
  */
-router.patch('/campaigns/:id/unfeature', async (req, res) => {
+router.patch('/campaigns/:id/unfeature', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -356,7 +360,7 @@ router.get('/users', async (req, res) => {
  * PATCH /api/admin/users/:id/ban
  * Ban a user
  */
-router.patch('/users/:id/ban', async (req, res) => {
+router.patch('/users/:id/ban', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
@@ -401,7 +405,7 @@ router.patch('/users/:id/ban', async (req, res) => {
  * PATCH /api/admin/users/:id/unban
  * Unban a user
  */
-router.patch('/users/:id/unban', async (req, res) => {
+router.patch('/users/:id/unban', adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -476,7 +480,7 @@ router.get('/audit-log', async (req, res) => {
  * PATCH /api/admin/users/:id/promote
  * Promote a user to admin — only super-admins may do this.
  */
-router.patch('/users/:id/promote', requireSuperAdmin, async (req, res) => {
+router.patch('/users/:id/promote', requireSuperAdmin, adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -515,7 +519,7 @@ router.patch('/users/:id/promote', requireSuperAdmin, async (req, res) => {
  * Demote an admin to regular user — only super-admins may do this.
  * Self-demotion is blocked. Demoting the last admin is blocked.
  */
-router.patch('/users/:id/demote', requireSuperAdmin, async (req, res) => {
+router.patch('/users/:id/demote', requireSuperAdmin, adminJsonParser, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -596,7 +600,7 @@ router.get('/milestones', async (req, res) => {
  * POST /api/admin/campaigns/:id/reconcile
  * Manually force a sync for a specific campaign's raised_amount.
  */
-router.post('/campaigns/:id/reconcile', async (req, res) => {
+router.post('/campaigns/:id/reconcile', adminJsonParser, async (req, res) => {
   try {
     const result = await reconcileSingleCampaign(req.params.id);
     res.json({ message: 'Reconciliation completed', result });

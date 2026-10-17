@@ -1,7 +1,11 @@
-const router = require("express").Router();
+const express = require("express");
+const router = express.Router();
 const db = require("../config/database");
 const { requireAuth } = require("../middleware/auth");
 const asyncHandler = require("../utils/asyncHandler");
+
+// Text-heavy update payloads are bounded per-route (tighter than the global limit).
+const updateBodyParser = express.json({ limit: "10kb" });
 
 function cleanText(value = "") {
   return String(value)
@@ -59,6 +63,7 @@ router.get(
 router.post(
   "/:id/updates",
   requireAuth,
+  updateBodyParser,
   requireCampaignCreator,
   asyncHandler(async (req, res) => {
     const title = cleanText(req.body.title);
@@ -82,6 +87,7 @@ router.post(
 router.patch(
   "/:id/updates/:updateId",
   requireAuth,
+  updateBodyParser,
   requireCampaignCreator,
   asyncHandler(async (req, res) => {
     const title = cleanText(req.body.title);
