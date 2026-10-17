@@ -17,6 +17,15 @@ services:
       context: ./backend
       dockerfile: Dockerfile.prod
     env_file: ./backend/.env
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -25,5 +34,13 @@ services:
       dockerfile: Dockerfile.prod
     ports:
       - "80:80"
-    depends_on: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      backend:
+        condition: service_healthy
     restart: unless-stopped

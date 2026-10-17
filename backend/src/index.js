@@ -31,6 +31,25 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 
+// Trust the reverse proxy so req.ip reflects the real client address.
+// Configurable via TRUST_PROXY (e.g. "1", "true", or a comma-separated list of hops/subnets).
+const trustProxyEnv = process.env.TRUST_PROXY;
+if (trustProxyEnv !== undefined && trustProxyEnv !== '') {
+  const normalized = trustProxyEnv.trim();
+  if (normalized === 'true') {
+    app.set('trust proxy', true);
+  } else if (normalized === 'false') {
+    app.set('trust proxy', false);
+  } else if (/^\d+$/.test(normalized)) {
+    app.set('trust proxy', parseInt(normalized, 10));
+  } else {
+    app.set('trust proxy', normalized.split(',').map((s) => s.trim()).filter(Boolean));
+  }
+} else {
+  // Default: trust a single proxy hop in front of the app.
+  app.set('trust proxy', 1);
+}
+
 app.use(helmet());
 app.use(
   cors({
