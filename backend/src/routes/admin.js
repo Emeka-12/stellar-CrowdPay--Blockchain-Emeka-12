@@ -441,18 +441,25 @@ router.patch('/users/:id/unban', async (req, res) => {
  */
 router.get('/audit-log', async (req, res) => {
   try {
-    const { limit = 100, offset = 0 } = req.query;
-    const limitNum = Math.min(parseInt(limit) || 100, 1000);
-    const offsetNum = parseInt(offset) || 0;
+    const { limit = 100, offset = 0, before_id: beforeId } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 100, 100);
+    const offsetNum = beforeId ? 0 : parseInt(offset) || 0;
 
+    if (beforeId && !/^[0-9a-f-]{36}$/i.test(beforeId)) {
+      return res.status(400).json({ error: 'before_id must be a UUID' });
+    }
+
+    // Keyset pagination: pass the last row's id as before_id to fetch the next page.
     const { rows } = await db.query(
       `SELECT a.id, a.admin_user_id, u.email as admin_email, a.action_type, 
               a.target_type, a.target_id, a.details, a.created_at
        FROM admin_actions a
        JOIN users u ON a.admin_user_id = u.id
-       ORDER BY a.created_at DESC
+       WHERE $3::uuid IS NULL
+          OR (a.created_at, a.id) < (SELECT created_at, id FROM admin_actions WHERE id = $3::uuid)
+       ORDER BY a.created_at DESC, a.id DESC
        LIMIT $1 OFFSET $2`,
-      [limitNum, offsetNum]
+      [limitNum, offsetNum, beforeId || null]
     );
 
     const { rows: countRows } = await db.query('SELECT COUNT(*) FROM admin_actions');
@@ -463,7 +470,8 @@ router.get('/audit-log', async (req, res) => {
       pagination: {
         limit: limitNum,
         offset: offsetNum,
-        total: total
+        total: total,
+        next_before_id: rows.length === limitNum ? rows[rows.length - 1].id : null,
       }
     });
   } catch (err) {

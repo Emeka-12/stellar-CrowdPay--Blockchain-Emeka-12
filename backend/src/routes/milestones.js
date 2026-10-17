@@ -3,6 +3,7 @@ const { Keypair } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const { sendAlert } = require('../services/alerting');
 const {
   buildWithdrawalTransaction,
@@ -571,8 +572,8 @@ const approveMilestoneReleaseHandler = async (req, res) => {
   }
 };
 
-router.post('/:id/release', requireAuth, approveMilestoneReleaseHandler);
+router.post('/:id/release', requireAuth, idempotency, approveMilestoneReleaseHandler);
 // Deprecated alias of POST /:id/release (see API.md).
-router.post('/:id/approve', requireAuth, approveMilestoneReleaseHandler);
+router.post('/:id/approve', requireAuth, idempotency, approveMilestoneReleaseHandler);
 
 module.exports = router;

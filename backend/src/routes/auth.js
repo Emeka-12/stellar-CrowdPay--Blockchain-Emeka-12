@@ -7,7 +7,7 @@ const { Keypair } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { ensureCustodialAccountFundedAndTrusted } = require('../services/stellarService');
-const { sendEmail, sendEmailSafe } = require('../services/emailService');
+const { sendEmail, sendEmailSafe, reserveEmailSend } = require('../services/emailService');
 const { requireAuth } = require('../middleware/auth');
 const { encryptWalletSecret } = require('../services/walletSecrets');
 const { isKycRequiredForCampaigns } = require('../services/kycProvider');
@@ -32,6 +32,7 @@ const ACCESS_TOKEN_COOKIE_NAME = 'cp_token';
 const REFRESH_TOKEN_COOKIE_NAME = 'cp_refresh_token';
 const REFRESH_TOKEN_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+const PASSWORD_RESET_EMAIL_COOLDOWN_MS = 5 * 60 * 1000;
 const FORGOT_PASSWORD_MESSAGE =
   'If that email exists, a password reset link has been sent.';
 
@@ -574,6 +575,12 @@ router.post('/resend-verification', resendVerificationLimiter, requireAuth, asyn
     });
   }
 
+  if (!(await reserveEmailSend(user.email, 'email_verification', RESEND_COOLDOWN_MS))) {
+    return res.status(429).json({
+      error: 'Please wait before requesting another verification email.',
+    });
+  }
+
   const verificationToken = crypto.randomBytes(32).toString('hex');
   await db.query(
     `UPDATE users
@@ -611,7 +618,8 @@ router.post(
       [normalizedEmail]
     );
 
-    if (rows.length) {
+    // Silently skip (same response) when the account is in cooldown or the address is suppressed.
+    if (rows.length && await reserveEmailSend(rows[0].email, 'password_reset', PASSWORD_RESET_EMAIL_COOLDOWN_MS)) {
       const user = rows[0];
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = hashToken(rawToken);
