@@ -29,7 +29,10 @@ const asyncHandler = require('../utils/asyncHandler');
  */
 
 const ACCESS_TOKEN_COOKIE_NAME = 'cp_token';
-const REFRESH_TOKEN_COOKIE_NAME = 'cp_refresh_token';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// __Host- binds the cookie to this exact host (no Domain, Path=/, Secure), blocking
+// subdomain cookie tossing. Browsers only accept it over HTTPS, so it is production-only.
+const REFRESH_TOKEN_COOKIE_NAME = IS_PRODUCTION ? '__Host-cp_refresh' : 'cp_refresh_token';
 const REFRESH_TOKEN_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const FORGOT_PASSWORD_MESSAGE =
@@ -103,8 +106,9 @@ function generateTokens(user) {
 function setRefreshTokenCookie(res, token, expiresAt) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: IS_PRODUCTION,
+    sameSite: 'strict',
+    path: '/',
     maxAge: REFRESH_TOKEN_COOKIE_MAX_AGE,
     expires: expiresAt,
   });
@@ -113,8 +117,9 @@ function setRefreshTokenCookie(res, token, expiresAt) {
 function clearRefreshTokenCookie(res) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, '', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: IS_PRODUCTION,
+    sameSite: 'strict',
+    path: '/',
     maxAge: 0,
     expires: new Date(0),
   });

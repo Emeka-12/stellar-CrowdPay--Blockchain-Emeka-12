@@ -57,6 +57,61 @@ jobs:
           ENABLE_CAMPAIGN_STATUS_CRON: 'false'
         run: npm test
 
+  db-migrate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: crowdpay_migrate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:password@localhost:5432/crowdpay_migrate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Apply schema and full migration chain
+        working-directory: ./backend
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema.sql
+          node db/migrate.js
+
+      - name: Re-run migrations (must be a no-op)
+        working-directory: ./backend
+        run: node db/migrate.js
+
+      - name: Seed twice (must be idempotent)
+        working-directory: ./backend
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f db/seed.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f db/seed.sql
+
+      - name: Schema integrity and integration tests
+        working-directory: ./backend
+        run: npm run test:db
+
   contract-checks:
     runs-on: ubuntu-latest
     steps:
@@ -147,6 +202,7 @@ jobs:
           PGPASSWORD: password
         run: |
           psql -h localhost -p 5433 -U postgres -d crowdpay -f backend/db/schema.sql
+          DATABASE_URL=postgresql://postgres:password@localhost:5433/crowdpay node backend/db/migrate.js
           psql -h localhost -p 5433 -U postgres -d crowdpay -f backend/db/seed.sql
 
       - name: Run E2E tests
