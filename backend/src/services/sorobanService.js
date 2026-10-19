@@ -9,11 +9,57 @@ const {
   Keypair,
   Operation,
   Asset,
+  StrKey,
 } = require('@stellar/stellar-sdk');
 const crypto = require('crypto');
 const { server, networkPassphrase, USDC } = require('../config/stellar');
 const logger = require('../config/logger');
 const { TX_TIMEOUT_CONTRIBUTION_S } = require('../config/constants');
+
+const CONTRACT_ID_LENGTH = 56;
+
+/**
+ * Returns true when `contractId` is a well-formed Soroban contract StrKey:
+ * starts with `C`, is 56 characters long, and has a valid checksum.
+ */
+function isValidContractId(contractId) {
+  if (typeof contractId !== 'string') return false;
+  if (contractId.length !== CONTRACT_ID_LENGTH) return false;
+  if (!contractId.startsWith('C')) return false;
+  try {
+    return StrKey.isValidContract(contractId);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns an Error when `contractId` is invalid, otherwise null.
+ * When `required` is true (Soroban mode enabled), a missing id is also an error.
+ */
+function validateContractId(contractId, { field = 'contractId', required = true } = {}) {
+  if (contractId === undefined || contractId === null || contractId === '') {
+    if (required) {
+      return new Error(`${field} is required and must be a valid Soroban contract ID`);
+    }
+    return null;
+  }
+  if (!isValidContractId(contractId)) {
+    return new Error(
+      `${field} is not a valid Soroban contract ID (expected 56-char StrKey starting with "C")`
+    );
+  }
+  return null;
+}
+
+/**
+ * Throws when `contractId` is invalid. Used before any Contract/Address construction.
+ */
+function assertValidContractId(contractId, options) {
+  const error = validateContractId(contractId, options);
+  if (error) throw error;
+  return contractId;
+}
 
 async function simulateAndPrepare(tx) {
   const simulation = await server.simulateTransaction(tx);
@@ -54,6 +100,7 @@ async function submitOperation(operation, signerSecret) {
 }
 
 async function invokeContract({ contractId, method, args, signerSecret }) {
+  assertValidContractId(contractId, { field: 'contractId' });
   return submitOperation(new Contract(contractId).call(method, ...args), signerSecret);
 }
 
@@ -114,6 +161,10 @@ async function provisionCampaignContracts({
   const escrowId = await deployContract(process.env.ESCROW_WASM_HASH, signerSecret);
   const milestonesId = await deployContract(process.env.MILESTONES_WASM_HASH, signerSecret);
 
+  // Never proceed with (or persist) IDs that are not valid contract StrKeys.
+  assertValidContractId(escrowId, { field: 'escrowContractId' });
+  assertValidContractId(milestonesId, { field: 'milestonesContractId' });
+
   const asset = assetType === 'XLM' ? Asset.native() : USDC;
   const campaignNumericId = BigInt('0x' + String(campaignId).replace(/-/g, '').slice(0, 16));
   const targetStroops = BigInt(Math.round(Number(targetAmount) * 1e7));
@@ -157,6 +208,10 @@ async function provisionCampaignContracts({
     throw new Error('Milestones contract verification failed: stored plan does not match');
   }
 
+  // Re-validate before returning so callers can safely persist these IDs.
+  assertValidContractId(escrowId, { field: 'escrowContractId' });
+  assertValidContractId(milestonesId, { field: 'milestonesContractId' });
+
   return { escrowContractId: escrowId, milestonesContractId: milestonesId };
 }
 
@@ -166,4 +221,7 @@ module.exports = {
   isProvisioningConfigured,
   encodeMilestone,
   nativeToScVal,
+  isValidContractId,
+  validateContractId,
+  assertValidContractId,
 };

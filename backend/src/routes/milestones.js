@@ -3,6 +3,7 @@ const { Keypair } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const { sendAlert } = require('../services/alerting');
 const {
   buildWithdrawalTransaction,
@@ -436,6 +437,16 @@ const approveMilestoneReleaseHandler = async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // Serialize concurrent approvals/reconciliations of the same milestone.
+    const { rows: lockedMilestone } = await client.query(
+      `SELECT id FROM milestones WHERE id = $1 AND status <> 'released' FOR UPDATE`,
+      [milestone.id]
+    );
+    if (!lockedMilestone.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Milestone already released' });
+    }
+
     const { rows: existingRelease } = await client.query(
       'SELECT id FROM withdrawal_requests WHERE milestone_id = $1 LIMIT 1',
       [milestone.id]
@@ -509,10 +520,14 @@ const approveMilestoneReleaseHandler = async (req, res) => {
            review_note = $1,
            approved_at = COALESCE(approved_at, NOW()),
            released_at = NOW()
-       WHERE id = $2
+       WHERE id = $2 AND status <> 'released'
        RETURNING *`,
       [reviewNote, milestone.id]
     );
+    if (!updatedMilestones.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Milestone already released' });
+    }
 
     // Soroban integration: Approve milestone on-chain
     const { rows: campaignRows } = await client.query(
@@ -571,8 +586,8 @@ const approveMilestoneReleaseHandler = async (req, res) => {
   }
 };
 
-router.post('/:id/release', requireAuth, approveMilestoneReleaseHandler);
+router.post('/:id/release', requireAuth, idempotency, approveMilestoneReleaseHandler);
 // Deprecated alias of POST /:id/release (see API.md).
-router.post('/:id/approve', requireAuth, approveMilestoneReleaseHandler);
+router.post('/:id/approve', requireAuth, idempotency, approveMilestoneReleaseHandler);
 
 module.exports = router;

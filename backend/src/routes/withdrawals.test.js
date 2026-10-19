@@ -346,6 +346,7 @@ test('POST /api/withdrawals/:id/approve/platform submits with dual signatures', 
           }],
         };
       }
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
       if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'submitted'")) {
         return { rows: [{ id: 'w-1', status: 'submitted', tx_hash: 'tx-hash' }] };
       }
@@ -477,6 +478,7 @@ test('POST /api/withdrawals/:id/approve/platform logs failure when Stellar rejec
           }],
         };
       }
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
       if (text.includes("SET status = 'failed'")) return { rows: [] };
       if (text.includes('INSERT INTO withdrawal_approval_events')) return { rows: [] };
       if (text.includes('UPDATE stellar_transactions') && text.includes("status = 'failed'")) {
@@ -550,6 +552,7 @@ function approveQueryImpl({ failUpdate = false, state = { status: 'pending' } } 
         }],
       };
     }
+    if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
     if (text.includes("SET unsigned_xdr = $1, platform_signed = TRUE")) {
       if (failUpdate) throw new Error('db connection lost');
       state.status = 'submitted';
@@ -618,4 +621,23 @@ test('approve: unknown outcome (Horizon lookup fails after submit error) returns
   cleanup();
   assert.equal(res.status, 503);
   assert.ok(!queries.some((q) => q.includes("SET status = 'failed'")));
+});
+
+test('approve: concurrent approval that loses the claim returns 409 without submitting', async () => {
+  let submitCalls = 0;
+  const base = approveQueryImpl();
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text, params) => {
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [] };
+      return base(text, params);
+    },
+    stellarImpl: {
+      submitSignedWithdrawal: async () => { submitCalls += 1; return 'tx-hash'; },
+    },
+  });
+  const res = await request(app).post('/api/withdrawals/w-1/approve/platform').set('Authorization', 'Bearer t').send({});
+  cleanup();
+  assert.equal(res.status, 409);
+  assert.equal(submitCalls, 0);
 });

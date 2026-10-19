@@ -2,6 +2,7 @@ const router = require('express').Router();
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const { sendAlert } = require('../services/alerting');
 const { withdrawalValidation, validateRequest } = require('../middleware/validation');
 const {
@@ -128,7 +129,7 @@ router.get('/capabilities', requireAuth, (req, res) => {
   res.json({ can_approve_platform: canPerformPlatformSignature(req.user.userId) });
 });
 
-router.post('/request', requireAuth, withdrawalValidation, validateRequest, async (req, res) => {
+router.post('/request', requireAuth, idempotency, withdrawalValidation, validateRequest, async (req, res) => {
   /**
    * @openapi
    * /api/withdrawals/request:
@@ -454,6 +455,21 @@ const platformApproveHandler = async (req, res) => {
     return res.status(422).json({ error: 'Insufficient signatures: expected creator + platform' });
   }
 
+  // Claim the withdrawal BEFORE any on-chain submission; only one concurrent approval can win.
+  const { rows: claimRows } = await db.query(
+    `UPDATE withdrawal_requests
+     SET platform_claimed_at = NOW()
+     WHERE id = $1 AND status = 'pending' AND platform_signed = FALSE AND platform_claimed_at IS NULL
+     RETURNING id`,
+    [req.params.id]
+  );
+  if (!claimRows.length) {
+    return res.status(409).json({ error: 'Withdrawal request is already being processed; refresh and try again.' });
+  }
+  const releaseClaim = () =>
+    db.query('UPDATE withdrawal_requests SET platform_claimed_at = NULL WHERE id = $1', [req.params.id])
+      .catch((e) => logger.error('Failed to release withdrawal claim', { withdrawal_id: req.params.id, error: e.message }));
+
   // Idempotency: the tx hash is derived from the envelope body, so a retry after an ambiguous
   // outcome (submitted but DB update lost) resolves to the same hash. Reconcile against Horizon
   // instead of submitting again.
@@ -495,6 +511,7 @@ const platformApproveHandler = async (req, res) => {
         tx_hash: expectedHash,
         error: lookupErr.message,
       });
+      await releaseClaim();
       return res.status(503).json({
         error: 'Withdrawal submission outcome is unknown. Retry approval shortly; it will reconcile with Stellar without double-submitting.',
       });
@@ -613,6 +630,7 @@ const platformApproveHandler = async (req, res) => {
       tx_hash: txHash,
       error: err.message,
     });
+    await releaseClaim();
     res.status(500).json({
       error: 'Transaction submitted but records could not be updated. Retry approval to reconcile; it will not resubmit.',
       tx_hash: txHash,
@@ -741,6 +759,7 @@ router.post('/:id/reject', requireAuth, requirePlatformApprover, async (req, res
       `UPDATE withdrawal_requests
        SET status = 'denied', denial_reason = $1
        WHERE id = $2 AND status = 'pending' AND creator_signed = TRUE AND platform_signed = FALSE
+         AND platform_claimed_at IS NULL
        RETURNING *`,
       [reason, req.params.id]
     );

@@ -6,27 +6,40 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U crowdpay"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crowdpay}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - app-net
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile.prod
     env_file: ./backend/.env
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - app-net
 
   frontend:
     build:
@@ -34,13 +47,22 @@ services:
       dockerfile: Dockerfile.prod
     ports:
       - "80:80"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost/ || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+      - "443:443"
     depends_on:
       backend:
         condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - app-net
+
+volumes:
+  pgdata:
+
+networks:
+  app-net:
+    driver: bridge

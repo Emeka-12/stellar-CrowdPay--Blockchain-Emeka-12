@@ -2,12 +2,103 @@ require('dotenv').config();
 require('./config/env').validateEnv();
 
 const Sentry = require('@sentry/node');
+
+function resolveTracesSampleRate() {
+  const fallback = process.env.NODE_ENV === 'production' ? 0.2 : 1.0;
+  const raw = process.env.SENTRY_TRACES_SAMPLE_RATE;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const parsed = parseFloat(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(1, Math.max(0, parsed));
+}
+
+function stripQueryString(url) {
+  if (typeof url !== 'string') return url;
+  const idx = url.indexOf('?');
+  return idx === -1 ? url : url.slice(0, idx);
+}
+
+const PII_HEADER_KEYS = [
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-auth-token',
+  'proxy-authorization',
+];
+
+function scrubHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return headers;
+  const scrubbed = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (PII_HEADER_KEYS.includes(String(key).toLowerCase())) continue;
+    scrubbed[key] = value;
+  }
+  return scrubbed;
+}
+
+function scrubTransactionEvent(event) {
+  if (!event || typeof event !== 'object') return event;
+
+  if (event.request) {
+    if (event.request.url) event.request.url = stripQueryString(event.request.url);
+    if (event.request.query_string) delete event.request.query_string;
+    if (event.request.headers) event.request.headers = scrubHeaders(event.request.headers);
+    if (event.request.cookies) delete event.request.cookies;
+    if (event.request.data) delete event.request.data;
+  }
+
+  if (event.transaction) event.transaction = stripQueryString(event.transaction);
+  if (event.transaction_info && event.transaction_info.source) {
+    // keep source metadata but ensure no query params leak through
+    event.transaction_info.source = stripQueryString(event.transaction_info.source);
+  }
+
+  if (event.user) {
+    event.user = {
+      id: event.user.id,
+    };
+  }
+
+  if (Array.isArray(event.spans)) {
+    event.spans = event.spans.map((span) => {
+      if (!span || typeof span !== 'object') return span;
+      const cleaned = { ...span };
+      if (cleaned.description) cleaned.description = stripQueryString(cleaned.description);
+      if (cleaned.op && typeof cleaned.op === 'string') {
+        cleaned.op = stripQueryString(cleaned.op);
+      }
+      if (cleaned.data && typeof cleaned.data === 'object') {
+        const data = { ...cleaned.data };
+        delete data['http.query'];
+        delete data['http.fragment'];
+        delete data['http.request.query'];
+        delete data['http.request.cookies'];
+        delete data['http.request.headers'];
+        delete data['http.response.headers'];
+        delete data['user.id'];
+        delete data['campaign.id'];
+        delete data['campaignId'];
+        delete data['userId'];
+        if (typeof data.url === 'string') data.url = stripQueryString(data.url);
+        if (typeof data['http.url'] === 'string') data['http.url'] = stripQueryString(data['http.url']);
+        if (typeof data['http.target'] === 'string') data['http.target'] = stripQueryString(data['http.target']);
+        cleaned.data = data;
+      }
+      return cleaned;
+    });
+  }
+
+  return event;
+}
+
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
   environment: process.env.NODE_ENV || 'development',
-  tracesSampleRate: process.env.NODE_ENV === 'production' ? 0.2 : 1.0,
+  tracesSampleRate: resolveTracesSampleRate(),
   enabled: !!process.env.SENTRY_DSN,
   integrations: [Sentry.expressIntegration()],
+  beforeSendTransaction: scrubTransactionEvent,
 });
 
 const path = require('path');
@@ -18,6 +109,7 @@ const cookieParser = require('cookie-parser');
 const logger = require('./config/logger');
 const { requestIdMiddleware } = require('./middleware/requestId');
 const { requestLogger } = require('./middleware/requestLogger');
+const { originCheck } = require('./middleware/originCheck');
 const { normalizeErrorResponse, errorHandler } = require('./middleware/errorHandler');
 const { startLedgerMonitor, getLedgerStreamHealth } = require('./services/ledgerMonitor');
 const { refreshActiveCampaignStatuses } = require('./services/campaignStatusService');
@@ -30,25 +122,6 @@ const swaggerJsdoc = require('swagger-jsdoc');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
-
-// Trust the reverse proxy so req.ip reflects the real client address.
-// Configurable via TRUST_PROXY (e.g. "1", "true", or a comma-separated list of hops/subnets).
-const trustProxyEnv = process.env.TRUST_PROXY;
-if (trustProxyEnv !== undefined && trustProxyEnv !== '') {
-  const normalized = trustProxyEnv.trim();
-  if (normalized === 'true') {
-    app.set('trust proxy', true);
-  } else if (normalized === 'false') {
-    app.set('trust proxy', false);
-  } else if (/^\d+$/.test(normalized)) {
-    app.set('trust proxy', parseInt(normalized, 10));
-  } else {
-    app.set('trust proxy', normalized.split(',').map((s) => s.trim()).filter(Boolean));
-  }
-} else {
-  // Default: trust a single proxy hop in front of the app.
-  app.set('trust proxy', 1);
-}
 
 app.use(helmet());
 app.use(
@@ -83,6 +156,7 @@ const globalApiLimiter = rateLimit({
   },
 });
 app.use('/api', globalApiLimiter);
+app.use('/api', originCheck);
 
 const openApiSpec = swaggerJsdoc({
   definition: {
@@ -123,14 +197,7 @@ app.use('/api/notifications', require('./routes/notifications'));
 app.get('/health', async (_, res) => {
   try {
     await db.query('SELECT 1');
-    res.json({
-      status: 'ok',
-      db: {
-        total: db.totalCount,
-        idle: db.idleCount,
-        waiting: db.waitingCount,
-      },
-    });
+    res.json({ status: 'ok' });
   } catch (err) {
     res.status(503).json({ status: 'error', error: err.message });
   }
