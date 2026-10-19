@@ -325,9 +325,62 @@ CREATE TABLE refresh_tokens (
   family_id       UUID DEFAULT gen_random_uuid(),
   expires_at      TIMESTAMPTZ NOT NULL,
   revoked_at      TIMESTAMPTZ,
+  token_version   INT DEFAULT 0,
   created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX refresh_tokens_user_active_idx ON refresh_tokens (user_id) WHERE revoked_at IS NULL;
 CREATE INDEX refresh_tokens_token_hash_idx ON refresh_tokens (token_hash);
 CREATE INDEX refresh_tokens_family_idx ON refresh_tokens (family_id);
+
+-- Migration tracking table pre-seeded for migrate:fresh
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  filename TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO schema_migrations (filename)
+SELECT f FROM (VALUES
+  ('001_add_campaign_wallet_secrets.sql'),
+  ('20260401_users_campaigns_contributions.sql'),
+  ('20260423_add_contribution_conversion_audit_fields.sql'),
+  ('20260423_withdrawal_approval_audit.sql'),
+  ('20260424_campaign_failure_and_refund_support.sql'),
+  ('20260425_add_password_reset_tokens.sql'),
+  ('20260425_refresh_tokens.sql'),
+  ('20260425_roles_dashboards_and_campaign_updates.sql'),
+  ('20260426_milestone_release_workflow.sql'),
+  ('20260426_platform_fee.sql'),
+  ('20260427_anchor_sep24_deposits.sql'),
+  ('20260428_campaign_cover_search_indexes.sql'),
+  ('20260428_contribution_limits.sql'),
+  ('20260428_creator_kyc.sql'),
+  ('20260428_dispute_resolution.sql'),
+  ('20260428_social_proof_updates.sql'),
+  ('20260429_add_soroban_contract_ids.sql'),
+  ('20260430_admin_moderation.sql'),
+  ('20260529_add_wallet_type.sql'),
+  ('20260601_notifications.sql'),
+  ('20260602_add_campaign_soft_delete.sql'),
+  ('20260602_add_featured_campaigns_198.sql'),
+  ('20260602_campaign_categories.sql'),
+  ('20260602_campaign_refund_mechanism.sql'),
+  ('20260602_campaign_search_vector.sql'),
+  ('20260602_campaign_webhooks.sql'),
+  ('20260610_add_email_verification.sql'),
+  ('20260615_campaign_status_events.sql'),
+  ('20260616_wallet_only_anchor_deposits.sql'),
+  ('20260624_soroban_contract_verification.sql'),
+  ('20260625_campaign_members.sql'),
+  ('20260625_user_wallet_key_history.sql'),
+  ('20260626_anchor_deposit_submission_claim.sql'),
+  ('20260627_milestone_release_claim.sql'),
+  ('20260924_contribution_backfill_audit.sql'),
+  ('20260925_add_token_version.sql'),
+  ('20260925_campaign_status_suspended_check_fix.sql'),
+  ('20260925_invite_email_binding.sql'),
+  ('20260925_super_admin_tier.sql'),
+  ('20260926_refresh_token_family_reuse_detection.sql'),
+  ('20260927_add_refresh_token_version.sql')
+) AS t(f)
+ON CONFLICT (filename) DO NOTHING;
