@@ -1,9 +1,11 @@
+const express = require('express');
 const router = require('express').Router();
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth, requireRole, optionalAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const {
   createCampaignWallet,
   getCampaignBalance,
@@ -14,6 +16,7 @@ const { emitWebhookEventForUser, WEBHOOK_EVENTS } = require('../services/webhook
 const { refreshCampaignStatus, refreshActiveCampaignStatuses } = require('../services/campaignStatusService');
 const { queueFailedCampaignRefunds } = require('../services/campaignStatusActions');
 const { provisionCampaignContracts } = require('../services/sorobanService');
+const { isValidContractId, isSorobanEnabled } = require('../services/sorobanService');
 const { sendEmailSafe } = require('../services/emailService');
 const { uploadCampaignCoverImage } = require('../services/storage');
 const { isKycRequiredForCampaigns } = require('../services/kycProvider');
@@ -42,6 +45,19 @@ async function provisionSorobanContracts(campaign, creatorPublicKey, milestones)
       logger.warn('Soroban provisioning not configured; campaign left pending', { campaign_id: campaign.id });
       return;
     }
+    // Never persist a malformed contract id: a typo here would only surface
+    // later during fund release, potentially locking the campaign.
+    if (!isValidContractId(contracts.escrowContractId) || !isValidContractId(contracts.milestonesContractId)) {
+      logger.error('Soroban provisioning returned invalid contract ids', {
+        campaign_id: campaign.id,
+        escrow_contract_id: contracts.escrowContractId,
+        milestones_contract_id: contracts.milestonesContractId,
+      });
+      await db
+        .query("UPDATE campaigns SET soroban_status = 'failed' WHERE id = $1", [campaign.id])
+        .catch(() => {});
+      return;
+    }
     await db.query(
       `UPDATE campaigns
        SET escrow_contract_id = $1, milestones_contract_id = $2, soroban_status = 'verified'
@@ -58,6 +74,24 @@ async function provisionSorobanContracts(campaign, creatorPublicKey, milestones)
 
 function stripHtml(value = '') {
   return String(value).replace(/<[^>]*>/g, '').trim();
+}
+
+/**
+ * Validate admin/env-supplied Soroban contract ids before they are persisted.
+ * Returns an error message string when invalid, otherwise null.
+ */
+function validateContractIdsInput({ escrow_contract_id, milestones_contract_id }) {
+  const fields = {
+    escrow_contract_id,
+    milestones_contract_id,
+  };
+  for (const [field, value] of Object.entries(fields)) {
+    if (value === undefined || value === null || value === '') continue;
+    if (!isValidContractId(value)) {
+      return `${field} must be a valid Soroban contract id (StrKey starting with "C", 56 characters)`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -113,7 +147,7 @@ const requireCampaignMember = (...allowedRoles) => {
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 20 },
   fileFilter: (_req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp'];
     if (!allowed.includes(file.mimetype)) {
@@ -126,6 +160,10 @@ const upload = multer({
 const SUPPORTED_ASSETS = getSupportedAssetCodes();
 const MILESTONE_PERCENT_SCALE = 10000;
 const MILESTONE_LIMIT = 5;
+
+// Text-heavy campaign routes accept markdown/description bodies; cap them tighter
+// than the global JSON limit so oversized payloads fail fast with a 413.
+const campaignBodyParser = express.json({ limit: '10kb' });
 
 const isTest = process.env.NODE_ENV === 'test';
 
@@ -726,7 +764,7 @@ router.post('/:id/trigger-refunds', requireAuth, requireRole('admin'), asyncHand
 }));
 
 // Create campaign (authenticated)
-router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignValidation, validateRequest, asyncHandler(async (req, res) => {
+router.post('/', requireAuth, requireRole('creator', 'admin'), idempotency, createCampaignValidation, validateRequest, asyncHandler(async (req, res) => {
   /**
    * @openapi
    * /api/campaigns:
@@ -759,7 +797,25 @@ router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignVal
    *       403:
    *         description: Forbidden
    */
-  const { title, description, target_amount, asset_type, deadline, milestones, min_contribution, max_contribution } = req.body;
+  const {
+    title,
+    description,
+    target_amount,
+    asset_type,
+    deadline,
+    milestones,
+    min_contribution,
+    max_contribution,
+    escrow_contract_id,
+    milestones_contract_id,
+  } = req.body;
+
+  if (isSorobanEnabled()) {
+    const contractIdError = validateContractIdsInput({ escrow_contract_id, milestones_contract_id });
+    if (contractIdError) {
+      return res.status(400).json({ error: contractIdError, code: 'INVALID_CONTRACT_ID' });
+    }
+  }
 
   let normalizedMilestones;
   try {
@@ -859,9 +915,16 @@ router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignVal
 }));
 
 // PATCH /campaigns/:id - Update campaign (title, description, deadline)
-router.patch('/:id', requireAuth, asyncHandler(async (req, res) => {
+router.patch('/:id', campaignBodyParser, requireAuth, asyncHandler(async (req, res) => {
   const campaignId = req.params.id;
-  const { title, description, deadline } = req.body;
+  const { title, description, deadline, escrow_contract_id, milestones_contract_id } = req.body;
+
+  if (isSorobanEnabled()) {
+    const contractIdError = validateContractIdsInput({ escrow_contract_id, milestones_contract_id });
+    if (contractIdError) {
+      return res.status(400).json({ error: contractIdError, code: 'INVALID_CONTRACT_ID' });
+    }
+  }
 
   // Check if campaign exists and belongs to user
   const { rows: campaignRows } = await db.query(
@@ -939,13 +1002,23 @@ router.patch('/:id', requireAuth, asyncHandler(async (req, res) => {
     updateParams.push(['deadline', deadline, `$${paramIndex++}`]);
   }
 
+  if (escrow_contract_id !== undefined) {
+    updates.escrow_contract_id = escrow_contract_id || null;
+    updateParams.push(['escrow_contract_id', escrow_contract_id || null, `$${paramIndex++}`]);
+  }
+
+  if (milestones_contract_id !== undefined) {
+    updates.milestones_contract_id = milestones_contract_id || null;
+    updateParams.push(['milestones_contract_id', milestones_contract_id || null, `$${paramIndex++}`]);
+  }
+
   // Check if any valid updates were provided
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No valid fields to update' });
   }
 
   // Check for invalid fields in request body
-  const allowedFields = ['title', 'description', 'deadline'];
+  const allowedFields = ['title', 'description', 'deadline', 'escrow_contract_id', 'milestones_contract_id'];
   for (const field of Object.keys(req.body)) {
     if (!allowedFields.includes(field)) {
       return res.status(422).json({

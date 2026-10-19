@@ -131,7 +131,7 @@ All tests must pass before submitting a PR. CI runs the same suite on every push
 
 - **Backend**: follow the patterns in `src/routes/` and `src/services/`; 2-space indent; single quotes; no semicolons debate — match what's already there
 - **Frontend**: functional components only; follow the existing page/component structure
-- **Database**: schema changes go in a new `db/migrations/` file — never edit `schema.sql`
+- **Database**: schema changes go in a new `db/migrations/` file named `YYYYMMDDHHMMSS_description.sql` using the current UTC time — never edit `schema.sql` or rename existing migrations
 - **Comments**: only add one if the *why* is genuinely non-obvious. Don't describe what the code does
 - **No extra files**: don't add `.md` docs, `NOTES.md`, `TODO.md`, config files, or example scripts unless the issue asks for them
 

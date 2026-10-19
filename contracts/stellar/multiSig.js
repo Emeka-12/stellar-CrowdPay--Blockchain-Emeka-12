@@ -16,8 +16,7 @@
  *   node contracts/stellar/multiSig.js --submit <xdr>
  */
 
-const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '../../backend/.env') });
+require('dotenv').config({ path: '../../backend/.env' });
 
 const {
   Keypair,
@@ -33,18 +32,11 @@ const {
 // Authoritative values live in backend/src/config/constants.js
 const TX_TIMEOUT_WITHDRAWAL_S = 300; // 5 minutes for standalone CLI script; backend uses 7-day TX_TIMEOUT_WITHDRAWAL_S
 
-const isTestnet = process.env.STELLAR_NETWORK !== 'mainnet';
-const networkPassphrase = isTestnet ? Networks.TESTNET : Networks.PUBLIC;
-
 const server = new Horizon.Server(
-  process.env.STELLAR_HORIZON_URL || (isTestnet ? 'https://horizon-testnet.stellar.org' : 'https://horizon.stellar.org')
+  process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org'
 );
+const networkPassphrase = Networks.TESTNET;
 const USDC = new Asset('USDC', process.env.USDC_ISSUER);
-
-function handleError(err) {
-  console.error(err);
-  process.exit(1);
-}
 
 async function buildWithdrawal(walletPublicKey, destPublicKey, amount, assetCode) {
   const account = await server.loadAccount(walletPublicKey);
@@ -64,21 +56,38 @@ async function buildWithdrawal(walletPublicKey, destPublicKey, amount, assetCode
 }
 
 function signTransaction(xdr, signerSecret) {
-  try {
-    const tx = new Transaction(xdr, networkPassphrase);
-    const keypair = Keypair.fromSecret(signerSecret);
-    tx.sign(keypair);
-    const signed = tx.toXDR();
-    console.log('Signed XDR:');
-    console.log(signed);
-  } catch (err) {
-    handleError(err);
-  }
+  const tx = new Transaction(xdr, networkPassphrase);
+  const keypair = Keypair.fromSecret(signerSecret);
+  tx.sign(keypair);
+  const signed = tx.toXDR();
+  console.log('Signed XDR:');
+  console.log(signed);
 }
 
 async function submitTransaction(xdr) {
-  // Add platform signature before submitting
+  if (!process.env.PLATFORM_SECRET_KEY) {
+    throw new Error('PLATFORM_SECRET_KEY is not set');
+  }
+
+  // Decode and assert transaction validity before co-signing
   const tx = new Transaction(xdr, networkPassphrase);
+
+  if (!tx.operations || tx.operations.length !== 1 || tx.operations[0].type !== 'payment') {
+    throw new Error('Transaction must contain exactly one payment operation');
+  }
+
+  const op = tx.operations[0];
+  if (!op.destination || !op.amount || parseFloat(op.amount) <= 0) {
+    throw new Error('Transaction operation has invalid destination or amount');
+  }
+
+  if (tx.timeBounds) {
+    const now = Math.floor(Date.now() / 1000);
+    if (tx.timeBounds.maxTime && parseInt(tx.timeBounds.maxTime, 10) < now) {
+      throw new Error('Transaction timeBounds have expired');
+    }
+  }
+
   const platformKeypair = Keypair.fromSecret(process.env.PLATFORM_SECRET_KEY);
   tx.sign(platformKeypair);
 
@@ -89,9 +98,9 @@ async function submitTransaction(xdr) {
 
 const [,, flag, ...args] = process.argv;
 
-if (flag === '--build') buildWithdrawal(args[0], args[1], args[2], args[3]).catch(handleError);
+if (flag === '--build') buildWithdrawal(args[0], args[1], args[2], args[3]).catch(console.error);
 else if (flag === '--sign') signTransaction(args[0], args[1]);
-else if (flag === '--submit') submitTransaction(args[0]).catch(handleError);
+else if (flag === '--submit') submitTransaction(args[0]).catch(console.error);
 else {
   console.log('Usage:');
   console.log('  node multiSig.js --build <walletPublicKey> <destPublicKey> <amount> <asset>');

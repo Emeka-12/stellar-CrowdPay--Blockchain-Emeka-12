@@ -35,7 +35,7 @@ router.get('/:campaignId/transactions', requireAuth, async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const limit = parseInt(req.query.limit) || 50;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const txs = await getWalletTransactionHistory(rows[0].wallet_public_key, limit);
   res.json(txs);
 });
@@ -51,7 +51,7 @@ router.get('/:campaignId/payments', requireAuth, async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const limit = parseInt(req.query.limit) || 100;
+  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
   const payments = await getWalletPayments(rows[0].wallet_public_key, limit);
   res.json(payments);
 });

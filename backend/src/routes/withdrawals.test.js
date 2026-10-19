@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const express = require('express');
 const request = require('supertest');
 const proxyquire = require('proxyquire').noCallThru();
+const StellarSdk = require('@stellar/stellar-sdk');
 
 function buildApp({ queryImpl, stellarImpl, userId = 'creator-1', role = 'creator', platformApproverUserId } = {}) {
   const prevApprover = process.env.PLATFORM_APPROVER_USER_ID;
@@ -64,6 +65,53 @@ function buildApp({ queryImpl, stellarImpl, userId = 'creator-1', role = 'creato
 }
 
 const VALID_DESTINATION = 'GASXEYHSSVN3WSHD4WSZ4O37HC2AG4JH2EB6UPHM6IXDXDRJRDJD4RZK';
+const TAMPERED_DESTINATION = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+
+// Deterministic testnet accounts used to build real XDRs for the integration path.
+const TESTNET_SOURCE = 'GASXEYHSSVN3WSHD4WSZ4O37HC2AG4JH2EB6UPHM6IXDXDRJRDJD4RZK';
+const TESTNET_PLATFORM = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+const TESTNET_ASSET_ISSUER = 'GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI';
+const TESTNET_USDC = new StellarSdk.Asset('USDC', TESTNET_ASSET_ISSUER);
+
+/**
+ * Build a real, deterministic Stellar XDR for a USDC payment withdrawal.
+ * Uses a fixed sequence number and time bounds so the output is reproducible.
+ */
+function buildDeterministicWithdrawalXdr({
+  destination = VALID_DESTINATION,
+  amount = '10.0000000',
+  sequence = '1234567890',
+  timebounds = { minTime: 0, maxTime: 0 },
+} = {}) {
+  const account = new StellarSdk.Account(TESTNET_SOURCE, sequence);
+  const builder = new StellarSdk.TransactionBuilder(account, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: StellarSdk.Networks.TESTNET,
+    timebounds,
+  })
+    .addOperation(
+      StellarSdk.Operation.payment({
+        destination,
+        asset: TESTNET_USDC,
+        amount,
+      }),
+    )
+    .setTimeout(StellarSdk.TimeoutInfinite);
+  return builder.build().toXDR();
+}
+
+/**
+ * Sign a deterministic XDR with a real (throwaway) keypair so the signature
+ * count reflects actual signatures rather than a mocked value.
+ */
+function signXdrWithKeypair(xdr, keypair) {
+  const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
+  tx.sign(keypair);
+  return tx.toXDR();
+}
+
+const CREATOR_KEYPAIR = StellarSdk.Keypair.random();
+const PLATFORM_KEYPAIR = StellarSdk.Keypair.random();
 
 function campaignRow(overrides = {}) {
   return {
@@ -346,6 +394,7 @@ test('POST /api/withdrawals/:id/approve/platform submits with dual signatures', 
           }],
         };
       }
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
       if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'submitted'")) {
         return { rows: [{ id: 'w-1', status: 'submitted', tx_hash: 'tx-hash' }] };
       }
@@ -477,6 +526,7 @@ test('POST /api/withdrawals/:id/approve/platform logs failure when Stellar rejec
           }],
         };
       }
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
       if (text.includes("SET status = 'failed'")) return { rows: [] };
       if (text.includes('INSERT INTO withdrawal_approval_events')) return { rows: [] };
       if (text.includes('UPDATE stellar_transactions') && text.includes("status = 'failed'")) {
@@ -550,6 +600,7 @@ function approveQueryImpl({ failUpdate = false, state = { status: 'pending' } } 
         }],
       };
     }
+    if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
     if (text.includes("SET unsigned_xdr = $1, platform_signed = TRUE")) {
       if (failUpdate) throw new Error('db connection lost');
       state.status = 'submitted';
@@ -618,4 +669,23 @@ test('approve: unknown outcome (Horizon lookup fails after submit error) returns
   cleanup();
   assert.equal(res.status, 503);
   assert.ok(!queries.some((q) => q.includes("SET status = 'failed'")));
+});
+
+test('approve: concurrent approval that loses the claim returns 409 without submitting', async () => {
+  let submitCalls = 0;
+  const base = approveQueryImpl();
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text, params) => {
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [] };
+      return base(text, params);
+    },
+    stellarImpl: {
+      submitSignedWithdrawal: async () => { submitCalls += 1; return 'tx-hash'; },
+    },
+  });
+  const res = await request(app).post('/api/withdrawals/w-1/approve/platform').set('Authorization', 'Bearer t').send({});
+  cleanup();
+  assert.equal(res.status, 409);
+  assert.equal(submitCalls, 0);
 });
