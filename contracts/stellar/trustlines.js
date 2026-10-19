@@ -9,17 +9,25 @@
  *   node contracts/stellar/trustlines.js --check <accountPublicKey> <assetCode>
  */
 
-require('dotenv').config({ path: '../../backend/.env' });
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../../backend/.env') });
 
 const { Keypair, TransactionBuilder, Operation, Asset, Networks, BASE_FEE, Horizon } = require('@stellar/stellar-sdk');
 
 // Authoritative value lives in backend/src/config/constants.js TX_TIMEOUT_CONTRIBUTION_S
 const TX_TIMEOUT_CONTRIBUTION_S = 30;
 
+const isTestnet = process.env.STELLAR_NETWORK !== 'mainnet';
+const networkPassphrase = isTestnet ? Networks.TESTNET : Networks.PUBLIC;
+
 const server = new Horizon.Server(
-  process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org'
+  process.env.STELLAR_HORIZON_URL || (isTestnet ? 'https://horizon-testnet.stellar.org' : 'https://horizon.stellar.org')
 );
-const networkPassphrase = Networks.TESTNET;
+
+function handleError(err) {
+  console.error(err);
+  process.exit(1);
+}
 
 async function addTrustline(accountSecret, assetCode, issuerPublicKey) {
   const keypair = Keypair.fromSecret(accountSecret);
@@ -51,8 +59,8 @@ async function checkTrustline(publicKey, assetCode) {
 
 const [,, flag, ...args] = process.argv;
 
-if (flag === '--add') addTrustline(args[0], args[1], args[2]).catch(console.error);
-else if (flag === '--check') checkTrustline(args[0], args[1]).catch(console.error);
+if (flag === '--add') addTrustline(args[0], args[1], args[2]).catch(handleError);
+else if (flag === '--check') checkTrustline(args[0], args[1]).catch(handleError);
 else {
   console.log('Usage:');
   console.log('  node trustlines.js --add <accountSecret> <assetCode> <issuerPublicKey>');
