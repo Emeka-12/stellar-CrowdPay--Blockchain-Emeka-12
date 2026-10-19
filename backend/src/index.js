@@ -86,8 +86,9 @@ const openApiSpec = swaggerJsdoc({
   },
   apis: ['./src/routes/*.js'],
 });
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
-
+if (process.env.NODE_ENV !== 'production' || process.env.DOCS_ENABLED === 'true') {
+  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
+}
 app.use('/api/auth', require('./routes/auth'));
 // Backwards/alternate compatibility for docs + clients expecting /api/users/register|login.
 app.use('/api/users', require('./routes/auth'));
@@ -104,6 +105,8 @@ app.use('/api/webhooks', require('./routes/webhooks'));
 app.use('/api/milestones', require('./routes/milestones'));
 app.use('/api', require('./routes/disputes'));
 app.use('/api/notifications', require('./routes/notifications'));
+
+app.use('/api/wallets', require('./routes/wallets'));
 
 app.get('/health', async (_, res) => {
   try {
