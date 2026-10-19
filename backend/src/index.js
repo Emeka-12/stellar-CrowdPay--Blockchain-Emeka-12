@@ -18,6 +18,7 @@ const cookieParser = require('cookie-parser');
 const logger = require('./config/logger');
 const { requestIdMiddleware } = require('./middleware/requestId');
 const { requestLogger } = require('./middleware/requestLogger');
+const { originCheck } = require('./middleware/originCheck');
 const { normalizeErrorResponse, errorHandler } = require('./middleware/errorHandler');
 const { startLedgerMonitor, getLedgerStreamHealth } = require('./services/ledgerMonitor');
 const { refreshActiveCampaignStatuses } = require('./services/campaignStatusService');
@@ -64,6 +65,7 @@ const globalApiLimiter = rateLimit({
   },
 });
 app.use('/api', globalApiLimiter);
+app.use('/api', originCheck);
 
 const openApiSpec = swaggerJsdoc({
   definition: {
@@ -104,14 +106,7 @@ app.use('/api/notifications', require('./routes/notifications'));
 app.get('/health', async (_, res) => {
   try {
     await db.query('SELECT 1');
-    res.json({
-      status: 'ok',
-      db: {
-        total: db.totalCount,
-        idle: db.idleCount,
-        waiting: db.waitingCount,
-      },
-    });
+    res.json({ status: 'ok' });
   } catch (err) {
     res.status(503).json({ status: 'error', error: err.message });
   }

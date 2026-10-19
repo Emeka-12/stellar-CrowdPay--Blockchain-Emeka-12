@@ -12,6 +12,7 @@
     "migrate": "node db/migrate.js",
     "test:db": "node --test db/*.test.js",
     "migrate:fresh": "psql $DATABASE_URL -f db/schema.sql && node db/migrate.js",
+    "db:seed": "psql $DATABASE_URL -v ON_ERROR_STOP=1 -1 -f db/seed.sql",
     "rotate-wallet-secrets": "node src/scripts/rotateWalletSecrets.js",
     "backfill-contributions": "node src/scripts/backfillContributions.js"
   },
