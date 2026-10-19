@@ -79,6 +79,40 @@ async function sendEmailSafe(opts) {
   }
 }
 
+/**
+ * Records a send of `emailType` to `email` unless the address is suppressed
+ * (bounce/complaint) or the same type was sent within `cooldownMs`.
+ *
+ * @returns {Promise<boolean>} true when the caller may send the email.
+ */
+async function reserveEmailSend(email, emailType, cooldownMs) {
+  const { rows } = await db.query(
+    `INSERT INTO email_send_log (email, email_type)
+     SELECT $1, $2
+     WHERE NOT EXISTS (
+         SELECT 1 FROM email_suppressions WHERE email = LOWER($1)
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM email_send_log
+         WHERE LOWER(email) = LOWER($1)
+           AND email_type = $2
+           AND sent_at > NOW() - ($3::int * INTERVAL '1 millisecond')
+       )
+     RETURNING id`,
+    [email, emailType, cooldownMs],
+  );
+  return rows.length > 0;
+}
+
+async function suppressEmail(email, reason) {
+  await db.query(
+    `INSERT INTO email_suppressions (email, reason)
+     VALUES (LOWER($1), $2)
+     ON CONFLICT (email) DO NOTHING`,
+    [email, reason],
+  );
+}
+
 function getStellarExpertTxUrl(txHash) {
   const network = process.env.STELLAR_NETWORK || "testnet";
   return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
@@ -138,5 +172,7 @@ async function sendContributionReceipt({
 module.exports = {
   sendEmail,
   sendEmailSafe,
+  reserveEmailSend,
+  suppressEmail,
   sendContributionReceipt,
 };

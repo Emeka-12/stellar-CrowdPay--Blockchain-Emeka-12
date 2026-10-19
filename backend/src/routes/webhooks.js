@@ -4,6 +4,7 @@ const db = require('../config/database');
 const { requireAuth } = require('../middleware/auth');
 const { ALL_WEBHOOK_EVENTS } = require('../services/webhookDispatcher');
 const { extractWebhookResult } = require('../services/kycProvider');
+const { suppressEmail } = require('../services/emailService');
 
 function isValidWebhookUrl(urlString) {
   try {
@@ -118,6 +119,37 @@ router.post('/kyc', async (req, res) => {
     kyc_status: rows[0].kyc_status,
     kyc_completed_at: rows[0].kyc_completed_at,
   });
+});
+
+// SendGrid (bounce/dropped/spamreport) and Mailgun (permanent failed/complained) events.
+const SUPPRESSING_EMAIL_EVENTS = new Set(['bounce', 'dropped', 'spamreport', 'complained']);
+
+function verifyEmailWebhookToken(req) {
+  const secret = process.env.EMAIL_WEBHOOK_SECRET;
+  if (!secret) return false;
+  const received = String(req.headers['x-email-webhook-token'] || req.query.token || '');
+  const a = Buffer.from(received);
+  const b = Buffer.from(secret);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+router.post('/email-events', async (req, res) => {
+  if (!verifyEmailWebhookToken(req)) {
+    return res.status(401).json({ error: 'Email webhook verification failed' });
+  }
+
+  const events = Array.isArray(req.body) ? req.body : [req.body?.['event-data'] || req.body || {}];
+  let suppressed = 0;
+  for (const evt of events) {
+    const email = evt.email || evt.recipient;
+    const type = evt.event;
+    const permanentFailure = type === 'failed' && evt.severity === 'permanent';
+    if (typeof email !== 'string' || !(SUPPRESSING_EMAIL_EVENTS.has(type) || permanentFailure)) continue;
+    await suppressEmail(email, type);
+    suppressed++;
+  }
+
+  res.json({ received: true, suppressed });
 });
 
 router.get('/', requireAuth, async (req, res) => {

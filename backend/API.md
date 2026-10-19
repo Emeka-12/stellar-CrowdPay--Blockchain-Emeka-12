@@ -14,12 +14,18 @@ In development, browse the interactive API docs at `GET /api/docs`.
 
 - **Base path**: every JSON route lives under `/api`, except `GET /health` and `GET /health/ledger`.
 - **Authentication**: `POST /api/auth/login` and `POST /api/auth/register` set an httpOnly `cp_token`
-  cookie (plus a `cp_refresh_token` cookie used by `POST /api/auth/refresh`). Browser clients send the
+  cookie (plus a refresh cookie used by `POST /api/auth/refresh`, named `__Host-cp_refresh` in production
+  and `cp_refresh_token` elsewhere). Browser clients send the
   cookie with `credentials: "include"`. Server-to-server clients may instead send
   `Authorization: Bearer <token>`, where the token is either the access token or a `cp_live_…` API key
   from `POST /api/api-keys`.
 - **Errors**: non-2xx responses have the shape `{ "error": "message" }`, and some include a
   machine-readable `code`.
+- **Idempotency**: `POST /api/campaigns`, `POST /api/contributions/submit-signed`,
+  `POST /api/withdrawals/request` and `POST /api/milestones/:id/release` (and its `/approve` alias)
+  accept an optional `Idempotency-Key` header (max 255 chars). A repeated key with the same body
+  returns the original 2xx response with `Idempotent-Replayed: true`; a different body returns `422`,
+  and a request still in progress returns `409`.
 
 Auth column in the table:
 
@@ -190,7 +196,7 @@ Deprecated aliases still respond but will be removed; new integrations must use 
 | `PATCH` | `/api/admin/users/:id/unban` | Admin | |
 | `PATCH` | `/api/admin/users/:id/promote` | Super admin | |
 | `PATCH` | `/api/admin/users/:id/demote` | Super admin | |
-| `GET` | `/api/admin/audit-log` | Admin | |
+| `GET` | `/api/admin/audit-log` | Admin | `limit` max 100; pass `pagination.next_before_id` as `before_id` for the next page |
 | `GET` | `/api/admin/milestones` | Admin | |
 
 ### Developer: API keys and webhooks
@@ -205,6 +211,7 @@ Deprecated aliases still respond but will be removed; new integrations must use 
 | `DELETE` | `/api/webhooks/:id` | User | |
 | `GET` | `/api/webhooks/deliveries` | User | |
 | `POST` | `/api/webhooks/kyc` | Signed | KYC provider callback |
+| `POST` | `/api/webhooks/email-events` | Token | Email provider bounce/complaint events; suppresses the address |
 
 ### Notifications
 
