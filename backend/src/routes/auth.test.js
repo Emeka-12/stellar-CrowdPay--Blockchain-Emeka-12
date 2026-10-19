@@ -327,10 +327,11 @@ test('POST /api/auth/register sets a refresh-token cookie', async () => {
 
   assert.equal(res.status, 201);
   const cookies = res.headers['set-cookie'] || [];
-  assert.ok(
-    cookies.some((c) => c.startsWith('cp_refresh_token=')),
-    'refresh-token cookie must be set after register'
-  );
+  const refreshCookie = cookies.find((c) => c.startsWith('cp_refresh_token='));
+  assert.ok(refreshCookie, 'refresh-token cookie must be set after register');
+  assert.match(refreshCookie, /Path=\/(;|$)/);
+  assert.match(refreshCookie, /SameSite=Strict/);
+  assert.match(refreshCookie, /HttpOnly/);
 });
 
 test('POST /api/auth/register returns 409 for duplicate email', async () => {

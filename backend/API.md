@@ -14,7 +14,8 @@ In development, browse the interactive API docs at `GET /api/docs`.
 
 - **Base path**: every JSON route lives under `/api`, except `GET /health` and `GET /health/ledger`.
 - **Authentication**: `POST /api/auth/login` and `POST /api/auth/register` set an httpOnly `cp_token`
-  cookie (plus a `cp_refresh_token` cookie used by `POST /api/auth/refresh`). Browser clients send the
+  cookie (plus a refresh cookie used by `POST /api/auth/refresh`, named `__Host-cp_refresh` in production
+  and `cp_refresh_token` elsewhere). Browser clients send the
   cookie with `credentials: "include"`. Server-to-server clients may instead send
   `Authorization: Bearer <token>`, where the token is either the access token or a `cp_live_…` API key
   from `POST /api/api-keys`.

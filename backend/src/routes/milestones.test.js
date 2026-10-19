@@ -27,6 +27,10 @@ function buildApp({ commitFails = false } = {}) {
     }
     if (text.includes('SET release_claimed_at = NULL')) { state.claimed = false; return { rows: [] }; }
     if (text.includes('SET release_tx_hash')) { state.txHashRecorded = params[0]; return { rows: [] }; }
+    if (text.includes('FROM milestones WHERE id = $1') && text.includes('FOR UPDATE')) {
+      state.lockedMilestone = true;
+      return { rows: state.released ? [] : [{ id: 'm-1' }] };
+    }
     if (text.includes('INSERT INTO withdrawal_requests')) return { rows: [{ id: 'w-1' }] };
     if (text.includes('UPDATE milestones') && text.includes("status = 'released'")) {
       state.pendingRelease = true;
@@ -96,4 +100,20 @@ test('a release whose DB commit failed is reconciled on retry without paying aga
   assert.equal(res2.status, 200);
   assert.equal(state.submits, 1);
   assert.equal(state.released, true);
+});
+
+test('release persistence locks the milestone row before recording the release', async () => {
+  const { app, state } = buildApp();
+  const res = await request(app).post('/api/milestones/m-1/approve').send({});
+  assert.equal(res.status, 200);
+  assert.equal(state.lockedMilestone, true);
+});
+
+test('reconciliation retry after the milestone was released returns 409 without a second release', async () => {
+  const { app, state } = buildApp();
+  state.txHashRecorded = 'hash-1';
+  state.released = true;
+  const res = await request(app).post('/api/milestones/m-1/approve').send({});
+  assert.equal(res.status, 409);
+  assert.equal(state.submits, 0);
 });

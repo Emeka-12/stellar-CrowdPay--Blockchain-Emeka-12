@@ -437,6 +437,16 @@ const approveMilestoneReleaseHandler = async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // Serialize concurrent approvals/reconciliations of the same milestone.
+    const { rows: lockedMilestone } = await client.query(
+      `SELECT id FROM milestones WHERE id = $1 AND status <> 'released' FOR UPDATE`,
+      [milestone.id]
+    );
+    if (!lockedMilestone.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Milestone already released' });
+    }
+
     const { rows: existingRelease } = await client.query(
       'SELECT id FROM withdrawal_requests WHERE milestone_id = $1 LIMIT 1',
       [milestone.id]
@@ -510,10 +520,14 @@ const approveMilestoneReleaseHandler = async (req, res) => {
            review_note = $1,
            approved_at = COALESCE(approved_at, NOW()),
            released_at = NOW()
-       WHERE id = $2
+       WHERE id = $2 AND status <> 'released'
        RETURNING *`,
       [reviewNote, milestone.id]
     );
+    if (!updatedMilestones.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Milestone already released' });
+    }
 
     // Soroban integration: Approve milestone on-chain
     const { rows: campaignRows } = await client.query(
