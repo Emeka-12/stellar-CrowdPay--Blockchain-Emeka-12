@@ -4,6 +4,7 @@ const rateLimit = require('express-rate-limit');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth, requireRole, optionalAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const {
   createCampaignWallet,
   getCampaignBalance,
@@ -758,7 +759,7 @@ router.post('/:id/trigger-refunds', requireAuth, requireRole('admin'), asyncHand
 }));
 
 // Create campaign (authenticated)
-router.post('/', requireAuth, requireRole('creator', 'admin'), createCampaignValidation, validateRequest, asyncHandler(async (req, res) => {
+router.post('/', requireAuth, requireRole('creator', 'admin'), idempotency, createCampaignValidation, validateRequest, asyncHandler(async (req, res) => {
   /**
    * @openapi
    * /api/campaigns:
