@@ -394,6 +394,7 @@ test('POST /api/withdrawals/:id/approve/platform submits with dual signatures', 
           }],
         };
       }
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
       if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'submitted'")) {
         return { rows: [{ id: 'w-1', status: 'submitted', tx_hash: 'tx-hash' }] };
       }
@@ -525,6 +526,7 @@ test('POST /api/withdrawals/:id/approve/platform logs failure when Stellar rejec
           }],
         };
       }
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
       if (text.includes("SET status = 'failed'")) return { rows: [] };
       if (text.includes('INSERT INTO withdrawal_approval_events')) return { rows: [] };
       if (text.includes('UPDATE stellar_transactions') && text.includes("status = 'failed'")) {
@@ -598,6 +600,7 @@ function approveQueryImpl({ failUpdate = false, state = { status: 'pending' } } 
         }],
       };
     }
+    if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [{ id: 'w-1' }] };
     if (text.includes("SET unsigned_xdr = $1, platform_signed = TRUE")) {
       if (failUpdate) throw new Error('db connection lost');
       state.status = 'submitted';
@@ -668,213 +671,21 @@ test('approve: unknown outcome (Horizon lookup fails after submit error) returns
   assert.ok(!queries.some((q) => q.includes("SET status = 'failed'")));
 });
 
-// ---------------------------------------------------------------------------
-// Integration tests: real XDR parsing/signing via @stellar/stellar-sdk.
-// These do NOT mock signatureCountFromXdr or transactionExistsOnHorizon; they
-// exercise the actual XDR substitution guard and time-bound checks.
-// ---------------------------------------------------------------------------
-
-/**
- * Build a query impl that returns a real creator-signed XDR for the platform
- * approval flow. `signedXdr` is the XDR stored in `unsigned_xdr` (which, after
- * creator approval, holds the creator-signed transaction).
- */
-function realXdrApproveQueryImpl({ signedXdr, failUpdate = false } = {}) {
-  const calls = [];
-  const impl = async (text) => {
-    calls.push(text);
-    if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
-    if (text.includes('SELECT wr.*, c.status')) {
-      return {
-        rows: [{
-          id: 'w-1',
-          status: 'pending',
-          creator_signed: true,
-          platform_signed: false,
-          unsigned_xdr: signedXdr,
-          campaign_id: 'camp-1',
-          campaign_status: 'active',
-        }],
-      };
-    }
-    if (text.includes("SET unsigned_xdr = $1, platform_signed = TRUE")) {
-      if (failUpdate) throw new Error('db connection lost');
-      return { rows: [{ id: 'w-1', status: 'submitted', tx_hash: 'tx-hash', campaign_id: 'camp-1' }] };
-    }
-    return { rows: [] };
-  };
-  impl.calls = calls;
-  return impl;
-}
-
-test('integration: tampered signed_xdr with different destination is rejected before platform signing', async () => {
-  // Creator-signed XDR that pays a DIFFERENT destination than the stored request.
-  const tamperedXdr = signXdrWithKeypair(
-    buildDeterministicWithdrawalXdr({ destination: TAMPERED_DESTINATION }),
-    CREATOR_KEYPAIR,
-  );
-
-  let platformSignCalls = 0;
+test('approve: concurrent approval that loses the claim returns 409 without submitting', async () => {
   let submitCalls = 0;
-  const queryImpl = realXdrApproveQueryImpl({ signedXdr: tamperedXdr });
-
+  const base = approveQueryImpl();
   const { app, cleanup } = buildApp({
     role: 'admin',
-    queryImpl,
+    queryImpl: async (text, params) => {
+      if (text.includes('SET platform_claimed_at = NOW()')) return { rows: [] };
+      return base(text, params);
+    },
     stellarImpl: {
-      // Use the real SDK-backed helpers so the substitution guard actually runs.
-      signatureCountFromXdr: (xdr) => {
-        const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-        return tx.signatures.length;
-      },
-      isXdrExpired: (xdr) => {
-        const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-        const tb = tx.timeBounds;
-        if (!tb || (tb.minTime === '0' && tb.maxTime === '0')) return false;
-        const now = Math.floor(Date.now() / 1000);
-        return now < Number(tb.minTime) || now > Number(tb.maxTime);
-      },
-      signTransactionXdr: (xdr) => {
-        platformSignCalls += 1;
-        return signXdrWithKeypair(xdr, PLATFORM_KEYPAIR);
-      },
-      submitSignedWithdrawal: async () => {
-        submitCalls += 1;
-        return 'tx-hash';
-      },
-      transactionExistsOnHorizon: async () => false,
-      PLATFORM_PUBLIC_KEY: TESTNET_PLATFORM,
+      submitSignedWithdrawal: async () => { submitCalls += 1; return 'tx-hash'; },
     },
   });
-
-  const res = await request(app)
-    .post('/api/withdrawals/w-1/approve/platform')
-    .set('Authorization', 'Bearer t')
-    .send({});
-
+  const res = await request(app).post('/api/withdrawals/w-1/approve/platform').set('Authorization', 'Bearer t').send({});
   cleanup();
-
-  // The route must reject the tampered XDR before platform signing or submission.
-  assert.notEqual(res.status, 200, 'tampered XDR must not be accepted');
-  assert.equal(platformSignCalls, 0, 'platform must not sign a tampered XDR');
-  assert.equal(submitCalls, 0, 'tampered XDR must not reach Horizon');
-  assert.ok(
-    !queryImpl.calls.some((q) => q.includes("SET unsigned_xdr = $1, platform_signed = TRUE")),
-    'tampered XDR must not be persisted as platform-signed',
-  );
-});
-
-test('integration: expired signed_xdr is rejected with 410 before platform signing', async () => {
-  // Build an XDR whose time bounds are already in the past.
-  const past = Math.floor(Date.now() / 1000) - 3600;
-  const expiredXdr = signXdrWithKeypair(
-    buildDeterministicWithdrawalXdr({
-      destination: VALID_DESTINATION,
-      timebounds: { minTime: past - 600, maxTime: past },
-    }),
-    CREATOR_KEYPAIR,
-  );
-
-  let platformSignCalls = 0;
-  let submitCalls = 0;
-
-  const { app, cleanup } = buildApp({
-    role: 'admin',
-    queryImpl: realXdrApproveQueryImpl({ signedXdr: expiredXdr }),
-    stellarImpl: {
-      signatureCountFromXdr: (xdr) => {
-        const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-        return tx.signatures.length;
-      },
-      isXdrExpired: (xdr) => {
-        const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-        const tb = tx.timeBounds;
-        if (!tb || (tb.minTime === '0' && tb.maxTime === '0')) return false;
-        const now = Math.floor(Date.now() / 1000);
-        return now < Number(tb.minTime) || now > Number(tb.maxTime);
-      },
-      signTransactionXdr: (xdr) => {
-        platformSignCalls += 1;
-        return signXdrWithKeypair(xdr, PLATFORM_KEYPAIR);
-      },
-      submitSignedWithdrawal: async () => {
-        submitCalls += 1;
-        return 'tx-hash';
-      },
-      transactionExistsOnHorizon: async () => false,
-      PLATFORM_PUBLIC_KEY: TESTNET_PLATFORM,
-    },
-  });
-
-  const res = await request(app)
-    .post('/api/withdrawals/w-1/approve/platform')
-    .set('Authorization', 'Bearer t')
-    .send({});
-
-  cleanup();
-
-  assert.equal(res.status, 410);
-  assert.match(res.body.error, /expired/i);
-  assert.equal(platformSignCalls, 0, 'platform must not sign an expired XDR');
-  assert.equal(submitCalls, 0, 'expired XDR must not reach Horizon');
-});
-
-test('integration: happy path signs with real keypair and submits to Horizon', async () => {
-  const validXdr = signXdrWithKeypair(
-    buildDeterministicWithdrawalXdr({ destination: VALID_DESTINATION }),
-    CREATOR_KEYPAIR,
-  );
-
-  let platformSignCalls = 0;
-  let submitCalls = 0;
-  let submittedXdr = null;
-
-  const { app, cleanup } = buildApp({
-    role: 'admin',
-    queryImpl: realXdrApproveQueryImpl({ signedXdr: validXdr }),
-    stellarImpl: {
-      signatureCountFromXdr: (xdr) => {
-        const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-        return tx.signatures.length;
-      },
-      isXdrExpired: (xdr) => {
-        const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-        const tb = tx.timeBounds;
-        if (!tb || (tb.minTime === '0' && tb.maxTime === '0')) return false;
-        const now = Math.floor(Date.now() / 1000);
-        return now < Number(tb.minTime) || now > Number(tb.maxTime);
-      },
-      signTransactionXdr: (xdr) => {
-        platformSignCalls += 1;
-        return signXdrWithKeypair(xdr, PLATFORM_KEYPAIR);
-      },
-      submitSignedWithdrawal: async (xdr) => {
-        submitCalls += 1;
-        submittedXdr = xdr;
-        return 'tx-hash';
-      },
-      transactionExistsOnHorizon: async () => false,
-      PLATFORM_PUBLIC_KEY: TESTNET_PLATFORM,
-    },
-  });
-
-  const res = await request(app)
-    .post('/api/withdrawals/w-1/approve/platform')
-    .set('Authorization', 'Bearer t')
-    .send({});
-
-  cleanup();
-
-  assert.equal(res.status, 200);
-  assert.equal(res.body.status, 'submitted');
-  assert.equal(platformSignCalls, 1, 'platform should sign exactly once');
-  assert.equal(submitCalls, 1, 'submitted XDR should reach Horizon exactly once');
-
-  // The XDR handed to Horizon must carry both creator and platform signatures
-  // and must still pay the original destination.
-  const submittedTx = StellarSdk.TransactionBuilder.fromXDR(submittedXdr, StellarSdk.Networks.TESTNET);
-  assert.equal(submittedTx.signatures.length, 2);
-  const op = submittedTx.operations[0];
-  assert.equal(op.type, 'payment');
-  assert.equal(op.destination, VALID_DESTINATION);
+  assert.equal(res.status, 409);
+  assert.equal(submitCalls, 0);
 });

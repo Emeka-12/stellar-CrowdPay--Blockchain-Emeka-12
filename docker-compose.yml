@@ -34,15 +34,30 @@ services:
       - ./backend:/app
       - /app/node_modules
     command: npm run dev
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   frontend:
     build: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
     ports:
       - "5173:5173"
     volumes:
       - ./frontend:/app
       - /app/node_modules
     command: npm run dev -- --host
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5173/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
 volumes:
   pgdata:

@@ -5,6 +5,7 @@ const logger = require('../config/logger');
 const { requireAuth, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { reconcileSingleCampaign } = require('../services/reconciliation');
 const cache = require('../utils/cache');
+const { getRequestContext } = require('../middleware/requestContext');
 
 // Per-route JSON body limit for admin payloads (tighter than the global limit).
 const adminJsonParser = express.json({ limit: '10kb' });
@@ -13,14 +14,52 @@ router.use(requireAuth);
 router.use(requireAdmin);
 
 /**
+ * Extract request attribution context (IP, user-agent, request id) from an
+ * Express request. `req.ip` is only trustworthy when `trust proxy` is set
+ * correctly on the app (see index.js).
+ */
+function getRequestAttribution(req) {
+  if (!req) {
+    return { actorIp: null, userAgent: null, requestId: null };
+  }
+
+  let requestId = req.id || req.requestId || null;
+  if (!requestId) {
+    try {
+      const ctx = getRequestContext();
+      requestId = ctx?.requestId || null;
+    } catch (_) {
+      requestId = null;
+    }
+  }
+
+  return {
+    actorIp: req.ip || null,
+    userAgent: req.headers?.['user-agent'] || null,
+    requestId,
+  };
+}
+
+/**
  * Log admin action to audit table
  */
-async function logAdminAction(adminUserId, actionType, targetType, targetId, details = null) {
+async function logAdminAction(adminUserId, actionType, targetType, targetId, details = null, req = null) {
   try {
+    const { actorIp, userAgent, requestId } = getRequestAttribution(req);
     await db.query(
-      `INSERT INTO admin_actions (admin_user_id, action_type, target_type, target_id, details)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [adminUserId, actionType, targetType, targetId, details ? JSON.stringify(details) : null]
+      `INSERT INTO admin_actions
+         (admin_user_id, action_type, target_type, target_id, details, actor_ip, user_agent, request_id)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)`,
+      [
+        adminUserId,
+        actionType,
+        targetType,
+        targetId,
+        details ? JSON.stringify(details) : null,
+        actorIp,
+        userAgent,
+        requestId,
+      ]
     );
   } catch (err) {
     logger.error('Failed to log admin action', { error: err.message, actionType, targetType });
@@ -52,6 +91,18 @@ router.get('/stats', async (req, res) => {
     logger.error('Error fetching admin stats', { error: err.message });
     res.status(500).json({ error: 'Failed to fetch statistics' });
   }
+});
+
+/**
+ * GET /api/admin/metrics/db-pool
+ * Database connection pool metrics
+ */
+router.get('/metrics/db-pool', (req, res) => {
+  res.json({
+    total: db.totalCount,
+    idle: db.idleCount,
+    waiting: db.waitingCount,
+  });
 });
 
 /**
@@ -142,7 +193,7 @@ router.patch('/campaigns/:id/suspend', adminJsonParser, async (req, res) => {
     await logAdminAction(req.user.userId, 'suspend', 'campaign', id, { 
       reason: reason || null,
       previous_status: campaign.status 
-    });
+    }, req);
 
     logger.info('Campaign suspended', { campaignId: id, adminId: req.user.userId, reason });
     cache.invalidate(`campaigns:id:${id}`);
@@ -182,7 +233,7 @@ router.patch('/campaigns/:id/restore', adminJsonParser, async (req, res) => {
 
       await logAdminAction(req.user.userId, 'restore', 'campaign', id, { 
         restored_from: 'deleted'
-      });
+      }, req);
 
       logger.info('Soft-deleted campaign restored', { campaignId: id, adminId: req.user.userId });
       cache.invalidate(`campaigns:id:${id}`);
@@ -202,7 +253,7 @@ router.patch('/campaigns/:id/restore', adminJsonParser, async (req, res) => {
 
     await logAdminAction(req.user.userId, 'restore', 'campaign', id, { 
       previous_status: campaign.status 
-    });
+    }, req);
 
     logger.info('Campaign restored', { campaignId: id, adminId: req.user.userId });
     cache.invalidate(`campaigns:id:${id}`);
@@ -239,7 +290,7 @@ router.delete('/campaigns/:id', adminJsonParser, async (req, res) => {
 
     await logAdminAction(req.user.userId, 'delete', 'campaign', id, { 
       reason: reason || null
-    });
+    }, req);
 
     logger.info('Campaign deleted', { campaignId: id, adminId: req.user.userId, reason });
     cache.invalidate(`campaigns:id:${id}`);
@@ -276,7 +327,7 @@ router.patch('/campaigns/:id/feature', adminJsonParser, async (req, res) => {
       [note || null, id]
     );
 
-    await logAdminAction(req.user.userId, 'feature', 'campaign', id, { note });
+    await logAdminAction(req.user.userId, 'feature', 'campaign', id, { note }, req);
 
     logger.info('Campaign featured', { campaignId: id, adminId: req.user.userId });
     cache.invalidate(`campaigns:id:${id}`);
@@ -313,7 +364,7 @@ router.patch('/campaigns/:id/unfeature', adminJsonParser, async (req, res) => {
       [id]
     );
 
-    await logAdminAction(req.user.userId, 'unfeature', 'campaign', id, {});
+    await logAdminAction(req.user.userId, 'unfeature', 'campaign', id, {}, req);
 
     logger.info('Campaign unfeatured', { campaignId: id, adminId: req.user.userId });
     cache.invalidate(`campaigns:id:${id}`);
@@ -391,7 +442,7 @@ router.patch('/users/:id/ban', adminJsonParser, async (req, res) => {
 
     await logAdminAction(req.user.userId, 'ban', 'user', id, { 
       reason: reason
-    });
+    }, req);
 
     logger.info('User banned', { userId: id, adminId: req.user.userId, reason });
     res.json({ message: 'User banned', user: updated[0] });
@@ -429,7 +480,7 @@ router.patch('/users/:id/unban', adminJsonParser, async (req, res) => {
       [id]
     );
 
-    await logAdminAction(req.user.userId, 'unban', 'user', id, {});
+    await logAdminAction(req.user.userId, 'unban', 'user', id, {}, req);
 
     logger.info('User unbanned', { userId: id, adminId: req.user.userId });
     res.json({ message: 'User unbanned', user: updated[0] });
@@ -445,18 +496,26 @@ router.patch('/users/:id/unban', adminJsonParser, async (req, res) => {
  */
 router.get('/audit-log', async (req, res) => {
   try {
-    const { limit = 100, offset = 0 } = req.query;
-    const limitNum = Math.min(parseInt(limit) || 100, 1000);
-    const offsetNum = parseInt(offset) || 0;
+    const { limit = 100, offset = 0, before_id: beforeId } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 100, 100);
+    const offsetNum = beforeId ? 0 : parseInt(offset) || 0;
 
+    if (beforeId && !/^[0-9a-f-]{36}$/i.test(beforeId)) {
+      return res.status(400).json({ error: 'before_id must be a UUID' });
+    }
+
+    // Keyset pagination: pass the last row's id as before_id to fetch the next page.
     const { rows } = await db.query(
       `SELECT a.id, a.admin_user_id, u.email as admin_email, a.action_type, 
-              a.target_type, a.target_id, a.details, a.created_at
+              a.target_type, a.target_id, a.details, a.actor_ip, a.user_agent,
+              a.request_id, a.created_at
        FROM admin_actions a
        JOIN users u ON a.admin_user_id = u.id
-       ORDER BY a.created_at DESC
+       WHERE $3::uuid IS NULL
+          OR (a.created_at, a.id) < (SELECT created_at, id FROM admin_actions WHERE id = $3::uuid)
+       ORDER BY a.created_at DESC, a.id DESC
        LIMIT $1 OFFSET $2`,
-      [limitNum, offsetNum]
+      [limitNum, offsetNum, beforeId || null]
     );
 
     const { rows: countRows } = await db.query('SELECT COUNT(*) FROM admin_actions');
@@ -467,7 +526,8 @@ router.get('/audit-log', async (req, res) => {
       pagination: {
         limit: limitNum,
         offset: offsetNum,
-        total: total
+        total: total,
+        next_before_id: rows.length === limitNum ? rows[rows.length - 1].id : null,
       }
     });
   } catch (err) {
@@ -504,7 +564,7 @@ router.patch('/users/:id/promote', requireSuperAdmin, adminJsonParser, async (re
       [id]
     );
 
-    await logAdminAction(req.user.userId, 'promote', 'user', id, {});
+    await logAdminAction(req.user.userId, 'promote', 'user', id, {}, req);
 
     logger.info('User promoted to admin', { userId: id, adminId: req.user.userId });
     res.json({ message: 'User promoted to admin', user: updated[0] });
@@ -558,7 +618,7 @@ router.patch('/users/:id/demote', requireSuperAdmin, adminJsonParser, async (req
       [id]
     );
 
-    await logAdminAction(req.user.userId, 'demote', 'user', id, {});
+    await logAdminAction(req.user.userId, 'demote', 'user', id, {}, req);
 
     logger.info('Admin demoted to user', { userId: id, adminId: req.user.userId });
     res.json({ message: 'Admin demoted to user', user: updated[0] });

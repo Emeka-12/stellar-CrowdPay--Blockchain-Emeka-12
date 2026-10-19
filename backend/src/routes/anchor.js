@@ -74,7 +74,210 @@ async function issueAnchorAuthToken({ anchor, user }) {
   );
 }
 
-async function ensureAnchorAuth({ anchor, sessionRow, user }) {
+async function refreshAnchorDeposit({ depositId, userId }) {
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: lockedRows } = await client.query(
+      `SELECT ad.*, u.wallet_public_key, u.wallet_secret_encrypted
+       FROM anchor_deposits ad
+       JOIN users u ON u.id = ad.user_id
+       WHERE ad.id = $1 AND ad.user_id = $2
+       FOR UPDATE OF ad`,
+      [depositId, userId]
+    );
+    if (!lockedRows.length) {
+      await client.query('ROLLBACK');
+      return { notFound: true };
+    }
+
+    let session = lockedRows[0];
+    const anchor = getAnchorById(session.anchor_id);
+    if (!anchor) {
+      await client.query('ROLLBACK');
+      return { anchorUnavailable: true };
+    }
+
+    const user = {
+      id: userId,
+      wallet_public_key: session.wallet_public_key,
+      wallet_secret_encrypted: session.wallet_secret_encrypted,
+    };
+
+    let auth = await ensureAnchorAuth({ anchor, sessionRow: session, user, client });
+    let remote;
+    try {
+      remote = await getAnchorTransaction({
+        anchor,
+        authToken: auth.token,
+        transactionId: session.anchor_transaction_id,
+      });
+    } catch (err) {
+      if (err.statusCode !== 401) throw err;
+      auth = await issueAnchorAuthToken({ anchor, user });
+      await client.query(
+        `UPDATE anchor_deposits
+         SET anchor_auth_token = $1,
+             anchor_auth_expires_at = $2,
+             updated_at = NOW()
+         WHERE id = $3`,
+        [auth.token, auth.expiresAt, session.id]
+      );
+      remote = await getAnchorTransaction({
+        anchor,
+        authToken: auth.token,
+        transactionId: session.anchor_transaction_id,
+      });
+    }
+
+    const remoteTx = remote.transaction || remote;
+    const remoteStatus = remoteTx.status || session.last_anchor_status || 'pending_anchor';
+    let localStatus = session.status;
+    if (isAnchorFailureStatus(remoteStatus)) {
+      localStatus = 'failed';
+    } else if (remoteStatus === 'completed' && session.contribution_id) {
+      localStatus = 'completed';
+    } else if (remoteStatus === 'completed' && session.contribution_tx_hash) {
+      localStatus = 'contribution_submitted';
+    } else if (remoteStatus === 'completed') {
+      localStatus = 'deposit_completed';
+    } else {
+      localStatus = 'pending_anchor';
+    }
+
+    await client.query(
+      `UPDATE anchor_deposits
+       SET status = $1,
+           last_anchor_status = $2,
+           last_anchor_payload = $3::jsonb,
+           updated_at = NOW(),
+           completed_at = CASE WHEN $1 IN ('completed', 'failed') THEN COALESCE(completed_at, NOW()) ELSE completed_at END
+       WHERE id = $4
+         AND NOT (contribution_tx_hash IS NOT NULL AND $1 = 'deposit_completed')`,
+      [localStatus, remoteStatus, JSON.stringify(remoteTx), session.id]
+    );
+
+    session = {
+      ...session,
+      status: localStatus,
+      last_anchor_status: remoteStatus,
+      last_anchor_payload: remoteTx,
+    };
+
+    if (remoteStatus === 'completed' && !session.contribution_tx_hash && !session.contribution_id) {
+      if (session.deposit_type === 'wallet') {
+        await client.query(
+          `UPDATE anchor_deposits
+           SET status = 'completed',
+               last_error = NULL,
+               updated_at = NOW(),
+               completed_at = COALESCE(completed_at, NOW())
+           WHERE id = $1`,
+          [session.id]
+        );
+      } else {
+        const campaign = await loadCampaignForContribution(session.campaign_id);
+        if (!campaign) {
+          await client.query(
+            `UPDATE anchor_deposits
+             SET status = 'failed',
+                 last_error = $1,
+                 updated_at = NOW(),
+                 completed_at = COALESCE(completed_at, NOW())
+             WHERE id = $2`,
+            ['Deposit completed, but the campaign is no longer accepting contributions.', session.id]
+          );
+        } else {
+          // Atomically claim the submission so concurrent polls/retries cannot double-fund.
+          const { rows: claimed } = await client.query(
+            `UPDATE anchor_deposits
+             SET contribution_submitting_at = NOW()
+             WHERE id = $1
+               AND contribution_tx_hash IS NULL
+               AND contribution_id IS NULL
+               AND contribution_submitting_at IS NULL
+             RETURNING id`,
+            [session.id]
+          );
+          // Another poll already owns the submission when the claim returns no row.
+          if (claimed.length) {
+            let result = null;
+            try {
+              result = await submitCustodialContribution({
+                campaign,
+                campaignId: session.campaign_id,
+                userId,
+                walletPublicKey: session.wallet_public_key,
+                walletSecretEncrypted: session.wallet_secret_encrypted,
+                amount: session.contribution_amount,
+                sendAsset: session.anchor_asset,
+                intentOverride: session.contribution_flow,
+                anchorMetadata: {
+                  anchor_id: session.anchor_id,
+                  anchor_transaction_id: session.anchor_transaction_id,
+                  anchor_asset: session.anchor_asset,
+                  anchor_amount: session.anchor_amount,
+                  anchor_deposit_id: session.id,
+                },
+              });
+            } catch (err) {
+              logger.error('Anchor contribution submission failed after deposit completion', {
+                anchor_deposit_id: session.id,
+                error: err.message,
+              });
+              // Submission definitively failed: release the claim so a later poll can retry.
+              await client.query(
+                `UPDATE anchor_deposits
+                 SET status = 'deposit_completed',
+                     contribution_submitting_at = NULL,
+                     last_error = $1,
+                     updated_at = NOW()
+                 WHERE id = $2`,
+                [err.message || 'Contribution submission failed after deposit completion', session.id]
+              );
+            }
+            // The claim stays set after a successful on-chain submission so it is never re-sent.
+            if (result) {
+              await client.query(
+                `UPDATE anchor_deposits
+                 SET status = 'contribution_submitted',
+                     contribution_tx_hash = $1,
+                     contribution_stellar_transaction_id = $2,
+                     last_error = NULL,
+                     updated_at = NOW()
+                 WHERE id = $3`,
+                [result.txHash, result.stellarTransactionId, session.id]
+              );
+            }
+          }
+        }
+      }
+    }
+
+    const { rows: refreshed } = await client.query(
+      'SELECT * FROM anchor_deposits WHERE id = $1',
+      [session.id]
+    );
+
+    await client.query('COMMIT');
+    return { session: refreshed[0] };
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      logger.error('Anchor deposit refresh rollback failed', {
+        anchor_deposit_id: depositId,
+        error: rollbackErr.message,
+      });
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function ensureAnchorAuth({ anchor, sessionRow, user, client = db }) {
   if (sessionRow.anchor_auth_token && sessionRow.anchor_auth_expires_at && new Date(sessionRow.anchor_auth_expires_at) > new Date(Date.now() + 30_000)) {
     return {
       token: sessionRow.anchor_auth_token,
@@ -84,7 +287,7 @@ async function ensureAnchorAuth({ anchor, sessionRow, user }) {
   }
 
   const auth = await issueAnchorAuthToken({ anchor, user });
-  await db.query(
+  await client.query(
     `UPDATE anchor_deposits
      SET anchor_auth_token = $1,
          anchor_auth_expires_at = $2,
@@ -314,188 +517,21 @@ router.post('/sep24/deposit', requireAuth, async (req, res) => {
 });
 
 router.get('/deposits/:id', requireAuth, async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT ad.*, u.wallet_public_key, u.wallet_secret_encrypted
-     FROM anchor_deposits ad
-     JOIN users u ON u.id = ad.user_id
-     WHERE ad.id = $1 AND ad.user_id = $2`,
-    [req.params.id, req.user.userId]
-  );
-  if (!rows.length) {
-    return res.status(404).json({ error: 'Anchor deposit session not found' });
-  }
-
-  let session = rows[0];
-  const anchor = getAnchorById(session.anchor_id);
-  if (!anchor) {
-    return res.status(503).json({ error: 'This anchor is no longer available in the current backend configuration' });
-  }
-
-  const user = {
-    id: req.user.userId,
-    wallet_public_key: session.wallet_public_key,
-    wallet_secret_encrypted: session.wallet_secret_encrypted,
-  };
-
   try {
-    let auth = await ensureAnchorAuth({ anchor, sessionRow: session, user });
-    let remote;
-    try {
-      remote = await getAnchorTransaction({
-        anchor,
-        authToken: auth.token,
-        transactionId: session.anchor_transaction_id,
-      });
-    } catch (err) {
-      if (err.statusCode !== 401) throw err;
-      auth = await issueAnchorAuthToken({ anchor, user });
-      await db.query(
-        `UPDATE anchor_deposits
-         SET anchor_auth_token = $1,
-             anchor_auth_expires_at = $2,
-             updated_at = NOW()
-         WHERE id = $3`,
-        [auth.token, auth.expiresAt, session.id]
-      );
-      remote = await getAnchorTransaction({
-        anchor,
-        authToken: auth.token,
-        transactionId: session.anchor_transaction_id,
-      });
+    const result = await refreshAnchorDeposit({
+      depositId: req.params.id,
+      userId: req.user.userId,
+    });
+    if (result.notFound) {
+      return res.status(404).json({ error: 'Anchor deposit session not found' });
     }
-
-    const remoteTx = remote.transaction || remote;
-    const remoteStatus = remoteTx.status || session.last_anchor_status || 'pending_anchor';
-    let localStatus = session.status;
-    if (isAnchorFailureStatus(remoteStatus)) {
-      localStatus = 'failed';
-    } else if (remoteStatus === 'completed' && session.contribution_id) {
-      localStatus = 'completed';
-    } else if (remoteStatus === 'completed' && session.contribution_tx_hash) {
-      localStatus = 'contribution_submitted';
-    } else if (remoteStatus === 'completed') {
-      localStatus = 'deposit_completed';
-    } else {
-      localStatus = 'pending_anchor';
+    if (result.anchorUnavailable) {
+      return res.status(503).json({ error: 'This anchor is no longer available in the current backend configuration' });
     }
-
-    await db.query(
-      `UPDATE anchor_deposits
-       SET status = $1,
-           last_anchor_status = $2,
-           last_anchor_payload = $3::jsonb,
-           updated_at = NOW(),
-           completed_at = CASE WHEN $1 IN ('completed', 'failed') THEN COALESCE(completed_at, NOW()) ELSE completed_at END
-       WHERE id = $4
-         AND NOT (contribution_tx_hash IS NOT NULL AND $1 = 'deposit_completed')`,
-      [localStatus, remoteStatus, JSON.stringify(remoteTx), session.id]
-    );
-
-    session = {
-      ...session,
-      status: localStatus,
-      last_anchor_status: remoteStatus,
-      last_anchor_payload: remoteTx,
-    };
-
-    if (remoteStatus === 'completed' && !session.contribution_tx_hash && !session.contribution_id) {
-      if (session.deposit_type === 'wallet') {
-        await db.query(
-          `UPDATE anchor_deposits
-           SET status = 'completed',
-               last_error = NULL,
-               updated_at = NOW(),
-               completed_at = COALESCE(completed_at, NOW())
-           WHERE id = $1`,
-          [session.id]
-        );
-      } else {
-        const campaign = await loadCampaignForContribution(session.campaign_id);
-        if (!campaign) {
-          await db.query(
-            `UPDATE anchor_deposits
-             SET status = 'failed',
-                 last_error = $1,
-                 updated_at = NOW(),
-                 completed_at = COALESCE(completed_at, NOW())
-             WHERE id = $2`,
-            ['Deposit completed, but the campaign is no longer accepting contributions.', session.id]
-          );
-        } else {
-          // Atomically claim the submission so concurrent polls/retries cannot double-fund.
-          const { rows: claimed } = await db.query(
-            `UPDATE anchor_deposits
-             SET contribution_submitting_at = NOW()
-             WHERE id = $1
-               AND contribution_tx_hash IS NULL
-               AND contribution_id IS NULL
-               AND contribution_submitting_at IS NULL
-             RETURNING id`,
-            [session.id]
-          );
-          // Another poll already owns the submission when the claim returns no row.
-          if (claimed.length) {
-            let result = null;
-            try {
-              result = await submitCustodialContribution({
-                campaign,
-                campaignId: session.campaign_id,
-                userId: req.user.userId,
-                walletPublicKey: session.wallet_public_key,
-                walletSecretEncrypted: session.wallet_secret_encrypted,
-                amount: session.contribution_amount,
-                sendAsset: session.anchor_asset,
-                intentOverride: session.contribution_flow,
-                anchorMetadata: {
-                  anchor_id: session.anchor_id,
-                  anchor_transaction_id: session.anchor_transaction_id,
-                  anchor_asset: session.anchor_asset,
-                  anchor_amount: session.anchor_amount,
-                  anchor_deposit_id: session.id,
-                },
-              });
-            } catch (err) {
-              logger.error('Anchor contribution submission failed after deposit completion', {
-                anchor_deposit_id: session.id,
-                error: err.message,
-              });
-              // Submission definitively failed: release the claim so a later poll can retry.
-              await db.query(
-                `UPDATE anchor_deposits
-                 SET status = 'deposit_completed',
-                     contribution_submitting_at = NULL,
-                     last_error = $1,
-                     updated_at = NOW()
-                 WHERE id = $2`,
-                [err.message || 'Contribution submission failed after deposit completion', session.id]
-              );
-            }
-            // The claim stays set after a successful on-chain submission so it is never re-sent.
-            if (result) {
-              await db.query(
-                `UPDATE anchor_deposits
-                 SET status = 'contribution_submitted',
-                     contribution_tx_hash = $1,
-                     contribution_stellar_transaction_id = $2,
-                     last_error = NULL,
-                     updated_at = NOW()
-                 WHERE id = $3`,
-                [result.txHash, result.stellarTransactionId, session.id]
-              );
-            }
-          }
-        }
-      }
-    }
-
-    const { rows: refreshed } = await db.query(
-      'SELECT * FROM anchor_deposits WHERE id = $1',
-      [session.id]
-    );
-    res.json(mapSessionForClient(refreshed[0]));
+    res.json(mapSessionForClient(result.session));
   } catch (err) {
     logger.error('Anchor deposit status sync failed', {
-      anchor_deposit_id: session.id,
+      anchor_deposit_id: req.params.id,
       error: err.message,
     });
     res.status(err.statusCode || 502).json({
@@ -505,3 +541,4 @@ router.get('/deposits/:id', requireAuth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.refreshAnchorDeposit = refreshAnchorDeposit;

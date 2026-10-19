@@ -162,6 +162,37 @@ cd frontend && npm test       # Vitest
 
 ---
 
+## Operations
+
+### Database backups & restore
+
+The production PostgreSQL database holds custodial wallet ciphertexts and KYC references, so it is backed up
+nightly and protected with point-in-time recovery (PITR). Backups are encrypted at rest (age/GPG) before leaving
+the host, retained per the schedule below, and restores are rehearsed every quarter.
+
+| Layer | What | Retention |
+|---|---|---|
+| Nightly `pg_dump` (custom format, encrypted) | Full logical backup, uploaded to off-host object storage | 30 daily, 12 weekly, 12 monthly |
+| WAL archiving (PITR) | Continuous `archive_command` shipping to object storage | 14 days |
+| Quarterly restore drill | Restore latest dump + PITR replay into a scratch instance and verify | Evidence recorded in the runbook |
+
+The nightly job runs as the `backup` sidecar in `docker-compose.prod.yml` (see `BACKUP_*` env vars). To take or
+restore a backup manually:
+
+```bash
+# Nightly dump (encrypted, uploaded)
+./scripts/backup.sh
+
+# Restore into a scratch database (never against production)
+./scripts/restore.sh --target crowdpay_restore --from latest
+```
+
+Full procedures — PITR configuration, encryption key handling, retention policy, and the quarterly restore drill
+checklist — live in [`backend/docs/backup_restore.md`](backend/docs/backup_restore.md). **Do not run destructive
+migrations without a verified backup taken in the last 24 hours.**
+
+---
+
 ## Part of Savitura
 
 - **[Fluxa](https://github.com/Savitura/Fluxa)** — the payment infrastructure layer

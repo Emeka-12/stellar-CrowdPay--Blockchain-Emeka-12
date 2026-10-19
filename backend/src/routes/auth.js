@@ -7,7 +7,7 @@ const { Keypair } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { ensureCustodialAccountFundedAndTrusted } = require('../services/stellarService');
-const { sendEmail, sendEmailSafe } = require('../services/emailService');
+const { sendEmail, sendEmailSafe, reserveEmailSend } = require('../services/emailService');
 const { requireAuth } = require('../middleware/auth');
 const { encryptWalletSecret } = require('../services/walletSecrets');
 const { isKycRequiredForCampaigns } = require('../services/kycProvider');
@@ -29,9 +29,13 @@ const asyncHandler = require('../utils/asyncHandler');
  */
 
 const ACCESS_TOKEN_COOKIE_NAME = 'cp_token';
-const REFRESH_TOKEN_COOKIE_NAME = 'cp_refresh_token';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// __Host- binds the cookie to this exact host (no Domain, Path=/, Secure), blocking
+// subdomain cookie tossing. Browsers only accept it over HTTPS, so it is production-only.
+const REFRESH_TOKEN_COOKIE_NAME = IS_PRODUCTION ? '__Host-cp_refresh' : 'cp_refresh_token';
 const REFRESH_TOKEN_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+const PASSWORD_RESET_EMAIL_COOLDOWN_MS = 5 * 60 * 1000;
 const FORGOT_PASSWORD_MESSAGE =
   'If that email exists, a password reset link has been sent.';
 
@@ -103,8 +107,9 @@ function generateTokens(user) {
 function setRefreshTokenCookie(res, token, expiresAt) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: IS_PRODUCTION,
+    sameSite: 'strict',
+    path: '/',
     maxAge: REFRESH_TOKEN_COOKIE_MAX_AGE,
     expires: expiresAt,
   });
@@ -113,8 +118,9 @@ function setRefreshTokenCookie(res, token, expiresAt) {
 function clearRefreshTokenCookie(res) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, '', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: IS_PRODUCTION,
+    sameSite: 'strict',
+    path: '/',
     maxAge: 0,
     expires: new Date(0),
   });
@@ -126,10 +132,18 @@ async function createRefreshToken(userId, familyId = null) {
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashToken(token);
   const resolvedFamilyId = familyId || crypto.randomUUID();
-  await db.query(
-    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id) VALUES ($1, $2, $3, $4)`,
-    [userId, tokenHash, expiresAt, resolvedFamilyId]
-  );
+  try {
+    await db.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id, token_version)
+       SELECT $1, $2, $3, $4, COALESCE(token_version, 0) FROM users WHERE id = $1`,
+      [userId, tokenHash, expiresAt, resolvedFamilyId]
+    );
+  } catch {
+    await db.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id) VALUES ($1, $2, $3, $4)`,
+      [userId, tokenHash, expiresAt, resolvedFamilyId]
+    );
+  }
   return { token, expiresAt, familyId: resolvedFamilyId };
 }
 
@@ -144,15 +158,30 @@ function parseRefreshExpiresIn(value) {
 
 async function validateRefreshToken(token) {
   const tokenHash = hashToken(token);
-  const { rows } = await db.query(
-    `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at,
-            u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
-            u.kyc_status, u.kyc_completed_at, u.token_version
-     FROM refresh_tokens rt
-     JOIN users u ON u.id = rt.user_id
-     WHERE rt.token_hash = $1`,
-    [tokenHash]
-  );
+  let rows;
+  try {
+    const res = await db.query(
+      `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at, rt.token_version AS rt_token_version,
+              u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
+              u.kyc_status, u.kyc_completed_at, u.token_version
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1`,
+      [tokenHash]
+    );
+    rows = res.rows;
+  } catch {
+    const res = await db.query(
+      `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at,
+              u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
+              u.kyc_status, u.kyc_completed_at, u.token_version
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1`,
+      [tokenHash]
+    );
+    rows = res.rows;
+  }
   if (!rows.length) return null;
   const rt = rows[0];
 
@@ -174,6 +203,21 @@ async function validateRefreshToken(token) {
       );
     }
     return { reuseDetected: true, user_id: rt.user_id, family_id: rt.family_id };
+  }
+
+  // Reject refresh tokens invalidated by password reset (stale token_version)
+  if (rt.rt_token_version !== undefined && rt.rt_token_version !== null) {
+    if (rt.rt_token_version < (rt.token_version ?? 0)) {
+      logger.warn('Refresh token invalidated by password reset', {
+        user_id: rt.user_id,
+        family_id: rt.family_id,
+      });
+      await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`,
+        [rt.token_id]
+      );
+      return null;
+    }
   }
 
   if (new Date(rt.expires_at) <= new Date()) {
@@ -574,6 +618,12 @@ router.post('/resend-verification', resendVerificationLimiter, requireAuth, asyn
     });
   }
 
+  if (!(await reserveEmailSend(user.email, 'email_verification', RESEND_COOLDOWN_MS))) {
+    return res.status(429).json({
+      error: 'Please wait before requesting another verification email.',
+    });
+  }
+
   const verificationToken = crypto.randomBytes(32).toString('hex');
   await db.query(
     `UPDATE users
@@ -611,7 +661,8 @@ router.post(
       [normalizedEmail]
     );
 
-    if (rows.length) {
+    // Silently skip (same response) when the account is in cooldown or the address is suppressed.
+    if (rows.length && await reserveEmailSend(rows[0].email, 'password_reset', PASSWORD_RESET_EMAIL_COOLDOWN_MS)) {
       const user = rows[0];
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = hashToken(rawToken);
