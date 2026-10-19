@@ -339,3 +339,40 @@ fn test_refund_non_contributor_fails() {
     client.refund(&non_contributor);
 }
 
+#[test]
+#[should_panic(expected = "Unauthorized caller")]
+fn test_unauthorized_approve_milestone_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_client, _) = create_token_contract(&env, &token_admin);
+
+    let client = setup_escrow(&env, &admin, 1000, 500, &token_client.address);
+    client.approve_milestone_withdrawal(&unauthorized_user, &200);
+}
+
+#[test]
+#[should_panic(expected = "Campaign failed, cannot withdraw funds")]
+fn test_failed_campaign_withdrawal_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(100);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_client, stellar_client) = create_token_contract(&env, &token_admin);
+
+    let contributor = Address::generate(&env);
+    stellar_client.mint(&contributor, &300);
+
+    let client = setup_escrow(&env, &admin, 1000, 500, &token_client.address);
+    client.deposit(&contributor, &300);
+
+    // After deadline passed and target not met
+    env.ledger().set_timestamp(501);
+    client.withdraw(&admin, &300);
+}
+
