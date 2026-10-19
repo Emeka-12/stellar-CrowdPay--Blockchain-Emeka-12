@@ -116,6 +116,7 @@ router.get(
 router.post(
   "/:id/updates",
   requireAuth,
+  updateBodyParser,
   requireCampaignCreator,
   asyncHandler(async (req, res) => {
     const rawTitle = String(req.body.title ?? "");
@@ -153,6 +154,7 @@ router.post(
 router.patch(
   "/:id/updates/:updateId",
   requireAuth,
+  updateBodyParser,
   requireCampaignCreator,
   asyncHandler(async (req, res) => {
     const rawTitle = String(req.body.title ?? "");

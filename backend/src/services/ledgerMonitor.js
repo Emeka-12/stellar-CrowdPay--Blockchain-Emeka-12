@@ -216,6 +216,10 @@ async function onPaymentRecord(campaignId, walletPublicKey, record, opts = {}) {
       wallet_public_key: walletPublicKey,
       tx_hash: record?.transaction_hash,
       error: lastError.message,
+    }, {
+      alert_key: "ledger_monitor_index_failure",
+      fingerprint: `${walletPublicKey}:${lastError.name || "Error"}`,
+      severity: "critical",
     });
     if (!stalledWallets.has(walletPublicKey)) {
       stalledWallets.set(walletPublicKey, campaignId);

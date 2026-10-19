@@ -120,6 +120,7 @@ const { getPlatformFeeBps } = require('./utils/amounts');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 const rateLimit = require('express-rate-limit');
+const { jsonBody } = require('./middleware/bodyLimits');
 
 const app = express();
 
@@ -179,17 +180,21 @@ const openApiSpec = swaggerJsdoc({
 });
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
 
+// Text-heavy routes get a tighter JSON body limit (10kb). These parsers are
+// mounted before the route handlers so oversized payloads consistently 413.
+const textBody = jsonBody({ limit: '10kb' });
+
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
-app.use("/api/campaigns", require("./routes/campaignUpdates"));
-app.use("/api/campaigns", require("./routes/campaigns"));
+app.use('/api/campaigns', textBody, require('./routes/campaignUpdates'));
+app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/anchor', require('./routes/anchor'));
 app.use('/api/contributions', require('./routes/contributions'));
 app.use('/api/withdrawals', require('./routes/withdrawals'));
 app.use('/api/stellar/transactions', require('./routes/stellarTransactions'));
-app.use('/api/admin', require('./routes/admin'));
+app.use('/api/admin', textBody, require('./routes/admin'));
 app.use('/api/api-keys', require('./routes/apiKeys'));
-app.use('/api/webhooks', require('./routes/webhooks'));
+app.use('/api/webhooks', textBody, require('./routes/webhooks'));
 app.use('/api/milestones', require('./routes/milestones'));
 app.use('/api', require('./routes/disputes'));
 app.use('/api/notifications', require('./routes/notifications'));
@@ -245,6 +250,12 @@ app.get('/health/ledger', async (_req, res) => {
     const body = await getLedgerStreamHealth();
     res.json(body);
   } catch (err) {
+    sendAlert('Ledger health check failed', {
+      alert_key: 'ledger_health',
+      fingerprint: 'health/ledger',
+      severity: 'critical',
+      error: err.message,
+    });
     res.status(500).json({ error: err.message || 'ledger health failed' });
   }
 });
@@ -305,7 +316,12 @@ async function bootstrap() {
 if (require.main === module) {
   bootstrap().catch((err) => {
     logger.error('Backend bootstrap failed', { error: err.message });
-    sendAlert('Backend bootstrap failed', { error: err.message });
+    sendAlert('Backend bootstrap failed', {
+      alert_key: 'backend_bootstrap',
+      fingerprint: 'startup/bootstrap',
+      severity: 'warning',
+      error: err.message,
+    });
     process.exit(1);
   });
 }

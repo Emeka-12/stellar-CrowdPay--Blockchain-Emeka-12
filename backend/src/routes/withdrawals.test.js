@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const express = require('express');
 const request = require('supertest');
 const proxyquire = require('proxyquire').noCallThru();
+const StellarSdk = require('@stellar/stellar-sdk');
 
 function buildApp({ queryImpl, stellarImpl, userId = 'creator-1', role = 'creator', platformApproverUserId } = {}) {
   const prevApprover = process.env.PLATFORM_APPROVER_USER_ID;
@@ -64,6 +65,53 @@ function buildApp({ queryImpl, stellarImpl, userId = 'creator-1', role = 'creato
 }
 
 const VALID_DESTINATION = 'GASXEYHSSVN3WSHD4WSZ4O37HC2AG4JH2EB6UPHM6IXDXDRJRDJD4RZK';
+const TAMPERED_DESTINATION = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+
+// Deterministic testnet accounts used to build real XDRs for the integration path.
+const TESTNET_SOURCE = 'GASXEYHSSVN3WSHD4WSZ4O37HC2AG4JH2EB6UPHM6IXDXDRJRDJD4RZK';
+const TESTNET_PLATFORM = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+const TESTNET_ASSET_ISSUER = 'GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI';
+const TESTNET_USDC = new StellarSdk.Asset('USDC', TESTNET_ASSET_ISSUER);
+
+/**
+ * Build a real, deterministic Stellar XDR for a USDC payment withdrawal.
+ * Uses a fixed sequence number and time bounds so the output is reproducible.
+ */
+function buildDeterministicWithdrawalXdr({
+  destination = VALID_DESTINATION,
+  amount = '10.0000000',
+  sequence = '1234567890',
+  timebounds = { minTime: 0, maxTime: 0 },
+} = {}) {
+  const account = new StellarSdk.Account(TESTNET_SOURCE, sequence);
+  const builder = new StellarSdk.TransactionBuilder(account, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: StellarSdk.Networks.TESTNET,
+    timebounds,
+  })
+    .addOperation(
+      StellarSdk.Operation.payment({
+        destination,
+        asset: TESTNET_USDC,
+        amount,
+      }),
+    )
+    .setTimeout(StellarSdk.TimeoutInfinite);
+  return builder.build().toXDR();
+}
+
+/**
+ * Sign a deterministic XDR with a real (throwaway) keypair so the signature
+ * count reflects actual signatures rather than a mocked value.
+ */
+function signXdrWithKeypair(xdr, keypair) {
+  const tx = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
+  tx.sign(keypair);
+  return tx.toXDR();
+}
+
+const CREATOR_KEYPAIR = StellarSdk.Keypair.random();
+const PLATFORM_KEYPAIR = StellarSdk.Keypair.random();
 
 function campaignRow(overrides = {}) {
   return {
