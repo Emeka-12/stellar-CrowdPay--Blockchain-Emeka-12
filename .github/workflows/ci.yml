@@ -1,5 +1,12 @@
 name: CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [ main ]
@@ -28,12 +35,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
 
       - name: Install dependencies
         working-directory: ./backend
@@ -43,19 +47,47 @@ jobs:
         working-directory: ./backend
         run: npm run lint
 
-      - name: Run test suite
+      - name: Run unit & integration tests
         working-directory: ./backend
         env:
-          DATABASE_URL: postgresql://postgres:password@localhost:5432/crowdpay_test
+          NODE_ENV: test
           JWT_SECRET: testsecret
           API_KEY_PEPPER: test-api-key-pepper
-          WALLET_SECRET_LOCAL_KEK: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-          PLATFORM_SECRET_KEY: SCVMQUS5EMTHWBLJTE5XCSCMHB2ZOVKRR4ATVTRPUNRCOGKRENIL3LHR
-          STELLAR_NETWORK: testnet
-          STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
           USDC_ISSUER: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
-          ENABLE_CAMPAIGN_STATUS_CRON: 'false'
-        run: npm test
+          STELLAR_NETWORK: testnet
+          PLATFORM_SECRET_KEY: SCVMQUS5EMTHWBLJTE5XCSCMHB2ZOVKRR4ATVTRPUNRCOGKRENIL3LHR
+          STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/crowdpay_test
+          WALLET_SECRET_LOCAL_KEK: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: |
+          psql -h localhost -U postgres -d crowdpay_test -f db/schema.sql
+          npm test
+
+  frontend-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run linter
+        working-directory: ./frontend
+        run: npm run lint
+
+      - name: Run format check
+        working-directory: ./frontend
+        run: npm run format:check
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: npm run build
 
   contract-checks:
     runs-on: ubuntu-latest
@@ -63,49 +95,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: contracts/soroban -> target
-
-      - name: Run contract tests
+      - name: Cargo test
         working-directory: ./contracts/soroban
         run: cargo test
-
-  frontend-checks:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ./frontend
-        run: npm ci
-
-      - name: Run linter
-        working-directory: ./frontend
-        run: npm run lint
-
-      - name: Run unit tests
-        working-directory: ./frontend
-        run: npm test
-
-      - name: Run build
-        working-directory: ./frontend
-        run: npm run build
 
   e2e:
     runs-on: ubuntu-latest
@@ -125,7 +122,8 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
@@ -152,7 +150,8 @@ jobs:
       - name: Run E2E tests
         env:
           CI: true
-          DATABASE_URL: postgresql://postgres:password@localhost:5432/crowdpay
+          DATABASE_URL: postgresql://postgres:password@localhost:5433/crowdpay
+          USDC_ISSUER: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
           JWT_SECRET: testsecret
           API_KEY_PEPPER: test-api-key-pepper
           WALLET_SECRET_LOCAL_KEK: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
