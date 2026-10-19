@@ -33,15 +33,28 @@ async function migrate() {
         continue;
       }
       const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-      console.log(`[migrate] Applying: ${file}`);
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query(
-        'INSERT INTO schema_migrations (filename) VALUES ($1)',
-        [file]
-      );
-      await client.query('COMMIT');
-      count++;
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query(
+          'INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING',
+          [file]
+        );
+        await client.query('COMMIT');
+        count++;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        // 42P07 = duplicate_table, 42701 = duplicate_column, 42P06 = duplicate_schema
+        if (['42P07', '42701', '42P06', '42710'].includes(err.code) || err.message.includes('already exists')) {
+          console.log(`[migrate] Schema objects for ${file} already exist; recording as applied.`);
+          await client.query(
+            'INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING',
+            [file]
+          );
+        } else {
+          throw err;
+        }
+      }
     }
 
     console.log(`[migrate] Done. ${count} migration(s) applied.`);

@@ -126,10 +126,18 @@ async function createRefreshToken(userId, familyId = null) {
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashToken(token);
   const resolvedFamilyId = familyId || crypto.randomUUID();
-  await db.query(
-    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id) VALUES ($1, $2, $3, $4)`,
-    [userId, tokenHash, expiresAt, resolvedFamilyId]
-  );
+  try {
+    await db.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id, token_version)
+       SELECT $1, $2, $3, $4, COALESCE(token_version, 0) FROM users WHERE id = $1`,
+      [userId, tokenHash, expiresAt, resolvedFamilyId]
+    );
+  } catch {
+    await db.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id) VALUES ($1, $2, $3, $4)`,
+      [userId, tokenHash, expiresAt, resolvedFamilyId]
+    );
+  }
   return { token, expiresAt, familyId: resolvedFamilyId };
 }
 
@@ -144,15 +152,30 @@ function parseRefreshExpiresIn(value) {
 
 async function validateRefreshToken(token) {
   const tokenHash = hashToken(token);
-  const { rows } = await db.query(
-    `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at,
-            u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
-            u.kyc_status, u.kyc_completed_at, u.token_version
-     FROM refresh_tokens rt
-     JOIN users u ON u.id = rt.user_id
-     WHERE rt.token_hash = $1`,
-    [tokenHash]
-  );
+  let rows;
+  try {
+    const res = await db.query(
+      `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at, rt.token_version AS rt_token_version,
+              u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
+              u.kyc_status, u.kyc_completed_at, u.token_version
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1`,
+      [tokenHash]
+    );
+    rows = res.rows;
+  } catch {
+    const res = await db.query(
+      `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at,
+              u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
+              u.kyc_status, u.kyc_completed_at, u.token_version
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1`,
+      [tokenHash]
+    );
+    rows = res.rows;
+  }
   if (!rows.length) return null;
   const rt = rows[0];
 
@@ -174,6 +197,21 @@ async function validateRefreshToken(token) {
       );
     }
     return { reuseDetected: true, user_id: rt.user_id, family_id: rt.family_id };
+  }
+
+  // Reject refresh tokens invalidated by password reset (stale token_version)
+  if (rt.rt_token_version !== undefined && rt.rt_token_version !== null) {
+    if (rt.rt_token_version < (rt.token_version ?? 0)) {
+      logger.warn('Refresh token invalidated by password reset', {
+        user_id: rt.user_id,
+        family_id: rt.family_id,
+      });
+      await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`,
+        [rt.token_id]
+      );
+      return null;
+    }
   }
 
   if (new Date(rt.expires_at) <= new Date()) {
