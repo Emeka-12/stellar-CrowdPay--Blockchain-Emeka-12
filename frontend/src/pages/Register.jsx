@@ -54,6 +54,10 @@ export default function Register() {
       setError(t('register.passwordsMismatch'));
       return;
     }
+    if (usingFreighter && !freighterPublicKey) {
+      setError(t('register.connectFreighter'));
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -97,7 +101,6 @@ export default function Register() {
       if (!pk) throw new Error('Freighter did not return a public key');
       setFreighterPublicKey(pk);
       setUsingFreighter(true);
-      setForm((f) => ({ ...f, password: f.password }));
     } catch (err) {
       setError(err.message || 'Could not connect to Freighter');
     }
@@ -110,11 +113,12 @@ export default function Register() {
         {t('register.subtitle')}
       </p>
       <form noValidate onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
-        <input placeholder={t('register.fullName')} value={form.name} onChange={set('name')} required />
-        <input type="email" placeholder={t('register.email')} value={form.email} onChange={set('email')} required />
+        <input aria-label={t('register.fullName')} placeholder={t('register.fullName')} value={form.name} onChange={set('name')} required />
+        <input aria-label={t('register.email')} type="email" placeholder={t('register.email')} value={form.email} onChange={set('email')} required />
         <div style={{ position: 'relative' }}>
           <input
             id="reg-password"
+            aria-label={t('register.password')}
             type={showPassword ? 'text' : 'password'}
             placeholder={t('register.password')}
             value={form.password}

@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const db = require('../config/database');
 const { requireAuth, requireRole } = require('../middleware/auth');
-const { sendEmail } = require('../services/emailService');
+const { sendEmailSafe } = require('../services/emailService');
 const logger = require('../config/logger');
 
 async function logDisputeEvent(client, { disputeId, actorId, action, note }) {
@@ -78,7 +78,7 @@ router.post('/campaigns/:id/disputes', requireAuth, async (req, res) => {
       [campaign.creator_id]
     );
     if (creatorRows.length) {
-      sendEmail({
+      sendEmailSafe({
         to: creatorRows[0].email,
         subject: `Dispute raised on your campaign "${campaign.title}"`,
         text: `A contributor has raised a dispute on your campaign "${campaign.title}".\nReason: ${reason}\n\nThe platform team will review and contact you shortly.`,
@@ -184,7 +184,7 @@ router.patch('/disputes/:id', requireAuth, requireRole('admin'), async (req, res
           `INSERT INTO withdrawal_requests
              (campaign_id, requested_by, amount, destination_key, unsigned_xdr,
               creator_signed, platform_signed, contribution_id, is_refund, dispute_id)
-           VALUES ($1, $2, $3, $4, $5, FALSE, FALSE, $6, TRUE, $7)
+           VALUES ($1, $2, $3, $4, $5, TRUE, FALSE, $6, TRUE, $7)
            RETURNING id`,
           [
             dispute.campaign_id, req.user.userId, contribution.amount,
@@ -207,7 +207,7 @@ router.patch('/disputes/:id', requireAuth, requireRole('admin'), async (req, res
         [dispute.raised_by]
       );
       if (userRows.length) {
-        sendEmail({
+        sendEmailSafe({
           to: userRows[0].email,
           subject: 'Your dispute has been resolved in your favour',
           text: `Your dispute has been resolved. A refund has been initiated for your contributions. ${resolution_note ? `\nNote: ${resolution_note}` : ''}`,

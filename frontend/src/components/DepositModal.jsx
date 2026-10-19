@@ -64,6 +64,7 @@ export default function DepositModal({ onClose, onSuccess }) {
   }, [session?.id, onSuccess, phase]);
 
   useEffect(() => {
+    const prevActive = document.activeElement;
     const modal = modalRef.current;
     if (!modal) return;
     const focusable = modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
@@ -79,7 +80,10 @@ export default function DepositModal({ onClose, onSuccess }) {
       }
     }
     modal.addEventListener('keydown', trapTab);
-    return () => modal.removeEventListener('keydown', trapTab);
+    return () => {
+      modal.removeEventListener('keydown', trapTab);
+      prevActive?.focus?.();
+    };
   }, [phase]);
 
   async function handleSubmit(e) {

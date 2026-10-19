@@ -2,12 +2,103 @@ require('dotenv').config();
 require('./config/env').validateEnv();
 
 const Sentry = require('@sentry/node');
+
+function resolveTracesSampleRate() {
+  const fallback = process.env.NODE_ENV === 'production' ? 0.2 : 1.0;
+  const raw = process.env.SENTRY_TRACES_SAMPLE_RATE;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const parsed = parseFloat(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(1, Math.max(0, parsed));
+}
+
+function stripQueryString(url) {
+  if (typeof url !== 'string') return url;
+  const idx = url.indexOf('?');
+  return idx === -1 ? url : url.slice(0, idx);
+}
+
+const PII_HEADER_KEYS = [
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-auth-token',
+  'proxy-authorization',
+];
+
+function scrubHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return headers;
+  const scrubbed = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (PII_HEADER_KEYS.includes(String(key).toLowerCase())) continue;
+    scrubbed[key] = value;
+  }
+  return scrubbed;
+}
+
+function scrubTransactionEvent(event) {
+  if (!event || typeof event !== 'object') return event;
+
+  if (event.request) {
+    if (event.request.url) event.request.url = stripQueryString(event.request.url);
+    if (event.request.query_string) delete event.request.query_string;
+    if (event.request.headers) event.request.headers = scrubHeaders(event.request.headers);
+    if (event.request.cookies) delete event.request.cookies;
+    if (event.request.data) delete event.request.data;
+  }
+
+  if (event.transaction) event.transaction = stripQueryString(event.transaction);
+  if (event.transaction_info && event.transaction_info.source) {
+    // keep source metadata but ensure no query params leak through
+    event.transaction_info.source = stripQueryString(event.transaction_info.source);
+  }
+
+  if (event.user) {
+    event.user = {
+      id: event.user.id,
+    };
+  }
+
+  if (Array.isArray(event.spans)) {
+    event.spans = event.spans.map((span) => {
+      if (!span || typeof span !== 'object') return span;
+      const cleaned = { ...span };
+      if (cleaned.description) cleaned.description = stripQueryString(cleaned.description);
+      if (cleaned.op && typeof cleaned.op === 'string') {
+        cleaned.op = stripQueryString(cleaned.op);
+      }
+      if (cleaned.data && typeof cleaned.data === 'object') {
+        const data = { ...cleaned.data };
+        delete data['http.query'];
+        delete data['http.fragment'];
+        delete data['http.request.query'];
+        delete data['http.request.cookies'];
+        delete data['http.request.headers'];
+        delete data['http.response.headers'];
+        delete data['user.id'];
+        delete data['campaign.id'];
+        delete data['campaignId'];
+        delete data['userId'];
+        if (typeof data.url === 'string') data.url = stripQueryString(data.url);
+        if (typeof data['http.url'] === 'string') data['http.url'] = stripQueryString(data['http.url']);
+        if (typeof data['http.target'] === 'string') data['http.target'] = stripQueryString(data['http.target']);
+        cleaned.data = data;
+      }
+      return cleaned;
+    });
+  }
+
+  return event;
+}
+
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
   environment: process.env.NODE_ENV || 'development',
-  tracesSampleRate: process.env.NODE_ENV === 'production' ? 0.2 : 1.0,
+  tracesSampleRate: resolveTracesSampleRate(),
   enabled: !!process.env.SENTRY_DSN,
   integrations: [Sentry.expressIntegration()],
+  beforeSendTransaction: scrubTransactionEvent,
 });
 
 const path = require('path');
@@ -18,12 +109,14 @@ const cookieParser = require('cookie-parser');
 const logger = require('./config/logger');
 const { requestIdMiddleware } = require('./middleware/requestId');
 const { requestLogger } = require('./middleware/requestLogger');
+const { originCheck } = require('./middleware/originCheck');
 const { normalizeErrorResponse, errorHandler } = require('./middleware/errorHandler');
 const { startLedgerMonitor, getLedgerStreamHealth } = require('./services/ledgerMonitor');
 const { refreshActiveCampaignStatuses } = require('./services/campaignStatusService');
 const { sendAlert } = require('./services/alerting');
 const { assertNoLegacyPlaintextUserWalletSecrets } = require('./services/walletSecrets');
 const db = require('./config/database');
+const { getPlatformFeeBps } = require('./utils/amounts');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 const rateLimit = require('express-rate-limit');
@@ -58,14 +151,12 @@ const globalApiLimiter = rateLimit({
     if (!isPost) return false;
     return (
       p === '/auth/register' ||
-      p === '/users/register' ||
-      p === '/auth/login' ||
-      p === '/users/login' ||
-      p === '/contributions'
+      p === '/auth/login'
     );
   },
 });
 app.use('/api', globalApiLimiter);
+app.use('/api', originCheck);
 
 const openApiSpec = swaggerJsdoc({
   definition: {
@@ -86,12 +177,9 @@ const openApiSpec = swaggerJsdoc({
   },
   apis: ['./src/routes/*.js'],
 });
-if (process.env.NODE_ENV !== 'production' || process.env.DOCS_ENABLED === 'true') {
-  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
-}
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
+
 app.use('/api/auth', require('./routes/auth'));
-// Backwards/alternate compatibility for docs + clients expecting /api/users/register|login.
-app.use('/api/users', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use("/api/campaigns", require("./routes/campaignUpdates"));
 app.use("/api/campaigns", require("./routes/campaigns"));
@@ -106,25 +194,16 @@ app.use('/api/milestones', require('./routes/milestones'));
 app.use('/api', require('./routes/disputes'));
 app.use('/api/notifications', require('./routes/notifications'));
 
-app.use('/api/wallets', require('./routes/wallets'));
-
 app.get('/health', async (_, res) => {
   try {
     await db.query('SELECT 1');
-    res.json({
-      status: 'ok',
-      db: {
-        total: db.totalCount,
-        idle: db.idleCount,
-        waiting: db.waitingCount,
-      },
-    });
+    res.json({ status: 'ok' });
   } catch (err) {
     res.status(503).json({ status: 'error', error: err.message });
   }
 });
 app.get('/api/config', (_, res) =>
-  res.json({ platform_fee_bps: parseInt(process.env.PLATFORM_FEE_BPS || '0', 10) })
+  res.json({ platform_fee_bps: getPlatformFeeBps() })
 );
 
 // Public platform stats — used on the hero / landing section.
@@ -136,7 +215,7 @@ app.get('/api/stats', async (_req, res) => {
   if (cached) return res.json(cached);
 
   try {
-    const db = require('./config/database');
+const db = require('./config/database');
     const [campaigns, raised, contributions] = await Promise.all([
       db.query(`SELECT COUNT(*)::int AS total
                 FROM campaigns
@@ -223,10 +302,12 @@ async function bootstrap() {
   });
 }
 
-bootstrap().catch((err) => {
-  logger.error('Backend bootstrap failed', { error: err.message });
-  sendAlert('Backend bootstrap failed', { error: err.message });
-  process.exit(1);
-});
+if (require.main === module) {
+  bootstrap().catch((err) => {
+    logger.error('Backend bootstrap failed', { error: err.message });
+    sendAlert('Backend bootstrap failed', { error: err.message });
+    process.exit(1);
+  });
+}
 
 module.exports = app;

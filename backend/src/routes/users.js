@@ -4,6 +4,7 @@ const { requireAuth } = require('../middleware/auth');
 const { createKycSession, isKycRequiredForCampaigns } = require('../services/kycProvider');
 const { listCreatorCampaigns, listUserContributions } = require('../services/userDashboardService');
 const asyncHandler = require('../utils/asyncHandler');
+const { updateUserValidation, validateRequest } = require('../middleware/validation');
 
 router.get('/me', requireAuth, asyncHandler(async (req, res) => {
   const { rows } = await db.query(
@@ -61,6 +62,7 @@ router.post('/me/kyc/start', requireAuth, asyncHandler(async (req, res) => {
   }
 }));
 
+// Deprecated alias of GET /api/campaigns/mine (see API.md).
 router.get('/me/campaigns', requireAuth, asyncHandler(async (req, res) => {
   const campaigns = await listCreatorCampaigns(req.user.userId);
   res.json(campaigns);
@@ -95,34 +97,23 @@ router.get('/me/balance', requireAuth, asyncHandler(async (req, res) => {
   res.json({ balance, public_key: rows[0].wallet_public_key });
 }));
 
+// Deprecated alias of GET /api/contributions/mine (see API.md).
 router.get('/me/contributions', requireAuth, asyncHandler(async (req, res) => {
   const rows = await listUserContributions(req.user.userId);
   if (rows === null) return res.status(404).json({ error: 'User not found' });
   res.json(rows);
 }));
 
-// GET /api/users/me — already proposed in issue #163, implement together
-router.get('/me', requireAuth, async (req, res) => {
+// PATCH /api/users/me — update display name only
+router.patch('/me', requireAuth, updateUserValidation, validateRequest, asyncHandler(async (req, res) => {
+  const { name } = req.body;
   const { rows } = await db.query(
-    `SELECT id, email, name, wallet_public_key, created_at FROM users WHERE id = $1`,
-    [req.user.userId]
+    `UPDATE users SET name = $1 WHERE id = $2
+     RETURNING id, email, name, wallet_public_key, wallet_type, role, kyc_status, kyc_completed_at, created_at`,
+    [name, req.user.userId]
   );
   if (!rows.length) return res.status(404).json({ error: 'User not found' });
   res.json(rows[0]);
-});
-
-// PATCH /api/users/me — update display name only
-router.patch('/me', requireAuth, async (req, res) => {
-  const { name } = req.body;
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'name is required' });
-  }
-  const { rows } = await db.query(
-    `UPDATE users SET name = $1 WHERE id = $2
-     RETURNING id, email, name, wallet_public_key, created_at`,
-    [name.trim(), req.user.userId]
-  );
-  res.json(rows[0]);
-});
+}));
 
 module.exports = router;

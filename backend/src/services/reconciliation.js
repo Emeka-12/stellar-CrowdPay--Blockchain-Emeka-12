@@ -18,12 +18,36 @@ async function reconcileCampaign(campaign) {
     const dbBalance = parseFloat(campaign.raised_amount);
 
     if (Math.abs(liveBalance - dbBalance) > 0.0000001) {
-      logger.warn(`[reconcile] Campaign ${campaign.id}: DB=${dbBalance} vs chain=${liveBalance}. Updating.`);
-      await db.query(
-        `UPDATE campaigns SET raised_amount = $1 WHERE id = $2`,
-        [liveBalance, campaign.id]
+      // #14 — raised_amount must be cumulative.
+      //
+      // The on-chain balance *decreases* after every legitimate withdrawal, so
+      // overwriting raised_amount with liveBalance would silently regress a
+      // funded campaign back to failed and corrupt contribution history.
+      //
+      // Correct behaviour:
+      //   • If the chain shows MORE than the DB (e.g. an off-system deposit was
+      //     missed), advance raised_amount to match — this is a genuine gap.
+      //   • If the chain shows LESS (i.e. funds were withdrawn), the DB value is
+      //     the ground truth; log the discrepancy but do NOT write it back.
+      if (liveBalance > dbBalance) {
+        logger.warn(
+          `[reconcile] Campaign ${campaign.id}: chain=${liveBalance} > DB=${dbBalance}. ` +
+          `Advancing raised_amount to match on-chain value.`
+        );
+        await db.query(
+          `UPDATE campaigns SET raised_amount = $1 WHERE id = $2`,
+          [liveBalance, campaign.id]
+        );
+        return { updated: true, direction: 'advanced', dbBalance, liveBalance };
+      }
+
+      // Chain < DB — funds have been withdrawn (expected) or there is a genuine
+      // discrepancy.  Either way, raised_amount stays cumulative.
+      logger.warn(
+        `[reconcile] Campaign ${campaign.id}: chain=${liveBalance} < DB=${dbBalance}. ` +
+        `Likely due to a withdrawal — raised_amount preserved (cumulative semantics).`
       );
-      return { updated: true, dbBalance, liveBalance };
+      return { updated: false, direction: 'skipped_decrement', dbBalance, liveBalance };
     }
     return { updated: false, dbBalance, liveBalance };
   } catch (err) {

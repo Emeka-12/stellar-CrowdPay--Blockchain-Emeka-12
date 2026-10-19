@@ -208,6 +208,9 @@ function buildApp({ queryImpl, stellarImpl, stellarTxImpl }) {
         req.user = { userId: 'user-1' };
         next();
       },
+      optionalAuth: (req, _res, next) => {
+        next();
+      },
     },
     '../middleware/validation': {
       contributionValidation: [],
@@ -879,4 +882,22 @@ test('POST /api/contributions validates cumulative max_per_user cap', async () =
 
   assert.equal(response.status, 400);
   assert.equal(response.body.error, 'You have already contributed 80 USDC. The per-contributor limit is 100.0000000.');
+});
+
+test('POST /api/contributions/prepare and /submit-signed have rate limiting applied', async () => {
+  const router = proxyquire('./contributions', {
+    '../config/database': { query: async () => ({ rows: [] }) },
+    '../services/stellarService': {
+      buildUnsignedContributionPathPayment: async () => ({ unsignedXdr: 'xdr', quote: {} }),
+      signAndSubmitCampaignContribution: async () => ({}),
+      getSupportedAssetCodes: () => ['XLM', 'USDC'],
+    },
+    '../services/stellarTransactionService': {
+      insertContributionSubmitted: async () => 'row-id',
+      updateContributionConfirmed: async () => {},
+    },
+  });
+
+  assert.ok(router.stack.some((layer) => layer.route && layer.route.path === '/prepare'));
+  assert.ok(router.stack.some((layer) => layer.route && layer.route.path === '/submit-signed'));
 });

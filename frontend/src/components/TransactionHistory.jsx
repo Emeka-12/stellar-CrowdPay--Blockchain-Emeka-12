@@ -1,16 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../services/api';
 import { stellarExpertTxUrl } from '../config/stellar';
+import RelativeTime from './RelativeTime';
 
 const PAGE_SIZE = 10;
-
-function timeAgo(dateStr) {
-  const diff = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
-  if (diff < 60) return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
 
 function KindBadge({ kind }) {
   const isContribution = kind === 'contribution';
@@ -107,7 +100,7 @@ export default function TransactionHistory({ campaignId, isCreator }) {
                     <KindBadge kind={tx.kind} />
                     <StatusPill status={tx.status} />
                   </div>
-                  <span style={styles.time}>{timeAgo(tx.created_at)}</span>
+                  <span style={styles.time}><RelativeTime date={tx.created_at} /></span>
                 </div>
 
                 {tx.tx_hash && (

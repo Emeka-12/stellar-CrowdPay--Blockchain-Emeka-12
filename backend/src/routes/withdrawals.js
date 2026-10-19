@@ -2,6 +2,7 @@ const router = require('express').Router();
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { requireAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const { sendAlert } = require('../services/alerting');
 const { withdrawalValidation, validateRequest } = require('../middleware/validation');
 const {
@@ -10,6 +11,8 @@ const {
   signTransactionXdr,
   signatureCountFromXdr,
   submitSignedWithdrawal,
+  getTransactionHash,
+  transactionExistsOnHorizon,
   isXdrExpired,
   PLATFORM_PUBLIC_KEY,
 } = require('../services/stellarService');
@@ -18,7 +21,7 @@ const {
   finalizeWithdrawalSubmitted,
   markWithdrawalFailed,
 } = require('../services/stellarTransactionService');
-const { sendEmail } = require('../services/emailService');
+const { sendEmailSafe } = require('../services/emailService');
 const { emitWebhookEventForUser, WEBHOOK_EVENTS } = require('../services/webhookDispatcher');
 const { withDecryptedWalletSecret } = require('../services/walletSecrets');
 const { createNotification } = require('../services/notifications');
@@ -93,7 +96,7 @@ router.get('/capabilities', requireAuth, (req, res) => {
   res.json({ can_approve_platform: canPerformPlatformSignature(req.user.userId) });
 });
 
-router.post('/request', requireAuth, withdrawalValidation, validateRequest, async (req, res) => {
+router.post('/request', requireAuth, idempotency, withdrawalValidation, validateRequest, async (req, res) => {
   /**
    * @openapi
    * /api/withdrawals/request:
@@ -389,7 +392,10 @@ const platformApproveHandler = async (req, res) => {
   if (requestRow.status !== 'pending') {
     return res.status(409).json({ error: 'Withdrawal request is no longer pending' });
   }
-  if (!requestRow.creator_signed) {
+  // #16 — For platform-initiated refunds (failed campaigns and dispute resolutions)
+  // creator_signed is pre-set to TRUE at creation time, so this guard only applies
+  // to voluntary creator-initiated withdrawals where the creator must sign first.
+  if (!requestRow.is_refund && !requestRow.creator_signed) {
     return res.status(409).json({ error: 'Creator approval is required before platform approval' });
   }
   if (requestRow.platform_signed) {
@@ -414,10 +420,75 @@ const platformApproveHandler = async (req, res) => {
     return res.status(422).json({ error: 'Insufficient signatures: expected creator + platform' });
   }
 
+  // Claim the withdrawal BEFORE any on-chain submission; only one concurrent approval can win.
+  const { rows: claimRows } = await db.query(
+    `UPDATE withdrawal_requests
+     SET platform_claimed_at = NOW()
+     WHERE id = $1 AND status = 'pending' AND platform_signed = FALSE AND platform_claimed_at IS NULL
+     RETURNING id`,
+    [req.params.id]
+  );
+  if (!claimRows.length) {
+    return res.status(409).json({ error: 'Withdrawal request is already being processed; refresh and try again.' });
+  }
+  const releaseClaim = () =>
+    db.query('UPDATE withdrawal_requests SET platform_claimed_at = NULL WHERE id = $1', [req.params.id])
+      .catch((e) => logger.error('Failed to release withdrawal claim', { withdrawal_id: req.params.id, error: e.message }));
+
+  // Idempotency: the tx hash is derived from the envelope body, so a retry after an ambiguous
+  // outcome (submitted but DB update lost) resolves to the same hash. Reconcile against Horizon
+  // instead of submitting again.
+  const expectedHash = getTransactionHash(signedXdr);
   let txHash;
+  let alreadyOnChain = false;
   try {
-    txHash = await submitSignedWithdrawal({ xdr: signedXdr });
-  } catch (err) {
+    alreadyOnChain = await transactionExistsOnHorizon(expectedHash);
+  } catch (lookupErr) {
+    logger.warn('Horizon pre-submit lookup failed; proceeding to submit', {
+      withdrawal_id: req.params.id,
+      error: lookupErr.message,
+    });
+  }
+
+  let submitError = null;
+  if (alreadyOnChain) {
+    txHash = expectedHash;
+    logger.warn('Withdrawal already on Stellar; reconciling records without resubmitting', {
+      withdrawal_id: req.params.id,
+      tx_hash: txHash,
+    });
+  } else {
+    try {
+      txHash = await submitSignedWithdrawal({ xdr: signedXdr });
+    } catch (err) {
+      submitError = err;
+    }
+  }
+
+  if (submitError) {
+    // The submit call may have failed after the network accepted the tx (timeout etc.).
+    let landed;
+    try {
+      landed = await transactionExistsOnHorizon(expectedHash);
+    } catch (lookupErr) {
+      logger.error('Withdrawal submission outcome unknown', {
+        withdrawal_id: req.params.id,
+        tx_hash: expectedHash,
+        error: lookupErr.message,
+      });
+      await releaseClaim();
+      return res.status(503).json({
+        error: 'Withdrawal submission outcome is unknown. Retry approval shortly; it will reconcile with Stellar without double-submitting.',
+      });
+    }
+    if (landed) {
+      txHash = expectedHash;
+      submitError = null;
+    }
+  }
+
+  if (submitError) {
+    const err = submitError;
     logger.error('Withdrawal Stellar submission failed', {
       withdrawal_id: req.params.id,
       error: err.message,
@@ -490,7 +561,7 @@ const platformApproveHandler = async (req, res) => {
       [requestRow.campaign_id]
     );
     if (cRows.length) {
-      sendEmail({
+      sendEmailSafe({
         to: cRows[0].email,
         subject: 'Withdrawal Approved',
         text: `Your withdrawal for ${requestRow.amount} has been approved by the platform. Transaction Hash: ${txHash}`
@@ -522,14 +593,18 @@ const platformApproveHandler = async (req, res) => {
       tx_hash: txHash,
       error: err.message,
     });
-    res.status(500).json({ error: 'Transaction submitted but failed to update records; check Stellar and audit trail.' });
+    await releaseClaim();
+    res.status(500).json({
+      error: 'Transaction submitted but records could not be updated. Retry approval to reconcile; it will not resubmit.',
+      tx_hash: txHash,
+    });
   } finally {
     client.release();
   }
 };
 
 router.post('/:id/approve/platform', requireAuth, requirePlatformApprover, platformApproveHandler);
-// Alias for docs + issue acceptance criteria
+// Deprecated alias of POST /:id/approve/platform (see API.md).
 router.post('/:id/approve', requireAuth, requirePlatformApprover, platformApproveHandler);
 
 router.post('/:id/cancel', requireAuth, async (req, res) => {
@@ -646,6 +721,7 @@ router.post('/:id/reject', requireAuth, requirePlatformApprover, async (req, res
       `UPDATE withdrawal_requests
        SET status = 'denied', denial_reason = $1
        WHERE id = $2 AND status = 'pending' AND creator_signed = TRUE AND platform_signed = FALSE
+         AND platform_claimed_at IS NULL
        RETURNING *`,
       [reason, req.params.id]
     );
@@ -667,7 +743,7 @@ router.post('/:id/reject', requireAuth, requirePlatformApprover, async (req, res
       [requestRow.campaign_id]
     );
     if (cRows.length) {
-      sendEmail({
+      sendEmailSafe({
         to: cRows[0].email,
         subject: 'Withdrawal Rejected',
         text: `Your withdrawal request has been rejected by the platform. Reason: ${reason}`
@@ -761,7 +837,7 @@ const withdrawalAuditHandler = async (req, res) => {
 };
 
 router.get('/:id/events', requireAuth, withdrawalAuditHandler);
-// Alias for docs + issue acceptance criteria
+// Deprecated alias of GET /:id/events (see API.md).
 router.get('/:id/audit', requireAuth, withdrawalAuditHandler);
 
 module.exports = router;

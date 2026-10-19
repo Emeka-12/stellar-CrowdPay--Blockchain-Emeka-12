@@ -44,9 +44,10 @@ jobs:
           node-version: '20'
 
       - name: Run DB migrations
+        working-directory: ./backend
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: node migrate.js
+        run: node db/migrate.js
 
       - name: Deploy frontend
         run: echo "Deploying frontend to static hosting..."

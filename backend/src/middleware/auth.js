@@ -4,7 +4,17 @@ const db = require('../config/database');
 const Sentry = require('@sentry/node');
 
 function apiKeyPepper() {
-  return process.env.API_KEY_PEPPER || process.env.JWT_SECRET || 'dev-api-key-pepper';
+  const pepper = process.env.API_KEY_PEPPER;
+  if (!pepper) {
+    // This should never be reached in production because validateEnv() in
+    // config/env.js fails the process at startup when API_KEY_PEPPER is unset.
+    // In tests the value is injected via the test environment.
+    throw new Error(
+      'API_KEY_PEPPER environment variable is required. ' +
+      'Set a dedicated secret independent of JWT_SECRET to prevent credential cross-contamination.'
+    );
+  }
+  return pepper;
 }
 
 function hashApiKey(rawKey) {
@@ -34,15 +44,24 @@ async function authenticate(req) {
     req.user = payload;
     req.auth = { kind: 'jwt', scopes: null };
     
-    // Load admin status from database
+    // Load admin status and validate token_version from database
     if (req.user.userId) {
       const { rows } = await db.query(
-        'SELECT is_admin, is_banned FROM users WHERE id = $1',
+        'SELECT role, is_admin, is_super_admin, is_banned, token_version FROM users WHERE id = $1',
         [req.user.userId]
       );
       if (rows.length) {
+        req.user.role = rows[0].role;
         req.user.is_admin = rows[0].is_admin;
+        req.user.is_super_admin = rows[0].is_super_admin;
         req.user.is_banned = rows[0].is_banned;
+
+        // Reject access tokens issued before the last password reset
+        const dbVersion = rows[0].token_version ?? 0;
+        const tokenVersion = payload.tv ?? 0;
+        if (tokenVersion < dbVersion) {
+          throw new Error('Token invalidated by password reset');
+        }
       }
     }
   } catch {
@@ -53,6 +72,13 @@ async function authenticate(req) {
 function requireAdmin(req, res, next) {
   if (!req.user || !req.user.is_admin) {
     return res.status(403).json({ error: 'Requires admin privileges' });
+  }
+  next();
+}
+
+function requireSuperAdmin(req, res, next) {
+  if (!req.user || !req.user.is_super_admin) {
+    return res.status(403).json({ error: 'Requires super-admin privileges' });
   }
   next();
 }
@@ -123,6 +149,13 @@ function assertApiKeyScopes(req, res) {
 function requireAuth(req, res, next) {
   authenticate(req)
     .then(() => {
+      // #15 — Enforce the banned flag. is_banned is re-read from DB in
+      // authenticate() so bans take effect immediately on every request.
+      // Admins are exempt so that platform staff can still access the system
+      // to investigate and manage banned accounts.
+      if (req.user?.is_banned && !req.user?.is_admin) {
+        return res.status(403).json({ error: 'Your account has been suspended' });
+      }
       if (!assertApiKeyScopes(req, res)) return;
       if (req.user?.userId) Sentry.setUser({ id: req.user.userId });
       next();
@@ -133,11 +166,28 @@ function requireAuth(req, res, next) {
     });
 }
 
+/**
+ * Middleware that attempts authentication but does not reject unauthenticated requests.
+ * Sets req.user if a valid token is present; leaves req.user undefined otherwise.
+ */
+function optionalAuth(req, res, next) {
+  authenticate(req)
+    .then(() => {
+      next();
+    })
+    .catch(() => {
+      // No token or invalid token — continue as anonymous
+      next();
+    });
+}
+
 module.exports = {
   requireAuth,
+  optionalAuth,
   authenticate,
   assertApiKeyScopes,
   hashApiKey,
   requireAdmin,
+  requireSuperAdmin,
   requireRole,
 };

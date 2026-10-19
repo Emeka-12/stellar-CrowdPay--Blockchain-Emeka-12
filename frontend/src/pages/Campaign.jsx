@@ -17,6 +17,12 @@ import CampaignQRCode from "../components/CampaignQRCode";
 import { getNetwork, signTransaction } from '@stellar/freighter-api';
 import { isConnected, getPublicKey } from "@stellar/freighter-api";
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(
+  /\/+$/,
+  "",
+);
+const BASE_URL = `${API_BASE_URL}/api`;
+
 function escapeHtml(text) {
   return text
     .replaceAll("&", "&amp;")
@@ -122,12 +128,18 @@ function ContributionRow({ c }) {
   );
 }
 
+function isCampaignOwner(user, campaign) {
+  const userId = user?.id ?? user?.userId;
+  return userId != null && campaign?.creator_id != null && String(userId) === String(campaign.creator_id);
+}
+
 export default function Campaign() {
   const contributeBtnRef = useRef(null);
+  const showAllRef = useRef(false);
   const { id } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
-  const { user, token } = useAuth();
+  const { user } = useAuth();
 
   const [campaign, setCampaign] = useState(null);
   const [loadError, setLoadError] = useState("");
@@ -160,6 +172,7 @@ export default function Campaign() {
   const [inviteSuccess, setInviteSuccess] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const [embedCopied, setEmbedCopied] = useState(false);
+  const [showEmbedSection, setShowEmbedSection] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
   const [isEditingCampaign, setIsEditingCampaign] = useState(false);
   const [editFormData, setEditFormData] = useState({
@@ -194,13 +207,13 @@ export default function Campaign() {
   useEffect(() => {
     setLoadError("");
     api
-      .getCampaign(id, token)
+      .getCampaign(id)
       .then((data) => {
         setCampaign(data);
         if (data.user_role === "owner") {
           setIsOwner(true);
           api
-            .getCampaignMembers(id, token)
+            .getCampaignMembers(id)
             .then(setMembers)
             .catch(() => {});
         } else {
@@ -226,13 +239,15 @@ export default function Campaign() {
       .getCampaignUpdates(id, { limit: 20 })
       .then(setUpdates)
       .catch(() => setUpdates([]));
-    api
-      .getCampaignAnalytics(id)
-      .then(setAnalytics)
-      .catch(() => setAnalytics(null));
+    if (user) {
+      api
+        .getCampaignAnalytics(id)
+        .then(setAnalytics)
+        .catch(() => setAnalytics(null));
+    }
 
     // Check for pending withdrawals
-    if (token) {
+    if (user) {
       api
         .listWithdrawals(id)
         .then((withdrawals) => {
@@ -241,7 +256,7 @@ export default function Campaign() {
         })
         .catch(() => setHasPendingWithdrawal(false));
     }
-  }, [id, token, contributed, showAll]);
+  }, [id, user, contributed, showAll]);
 
   useEffect(() => {
     if (!id) return;
@@ -266,7 +281,7 @@ export default function Campaign() {
       if (document.visibilityState !== "visible") return;
       try {
         const [nextCampaign, nextContributionsData] = await Promise.all([
-          api.getCampaign(id, token),
+          api.getCampaign(id),
           api.getContributions(id, { limit: showAll ? 100 : 10, offset: 0 }),
         ]);
         if (aborted) return;
@@ -303,55 +318,111 @@ export default function Campaign() {
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [id, token, isLive, campaign, showAll]);
+  }, [id, isLive, campaign, showAll]);
 
   useEffect(() => {
+    showAllRef.current = showAll;
+  }, [showAll]);
+
+  useEffect(() => {
+    if (!id) return;
     if (!window.EventSource) return;
 
-    const es = new EventSource(`/api/campaigns/${id}/stream`);
+    let es = null;
+    let reconnectTimer = null;
+    let retryDelay = 1000;
+    const maxRetryDelay = 30000;
+    let isMounted = true;
 
-    es.onopen = () => setIsLive(true);
+    function connect() {
+      if (!isMounted) return;
+      if (es) {
+        try {
+          es.close();
+        } catch {}
+        es = null;
+      }
 
-    es.onmessage = (e) => {
-      let msg;
       try {
-        msg = JSON.parse(e.data);
+        es = new EventSource(`${BASE_URL}/campaigns/${id}/stream`);
       } catch {
+        scheduleReconnect();
         return;
       }
 
-      if (msg.type === "contribution") {
-        setCampaign((prev) =>
-          prev ? { ...prev, raised_amount: msg.raised_amount } : prev,
-        );
-        setContributions((prev) => {
-          const current = prev || [];
-          const exists = current.some(
-            (c) => c.tx_hash === msg.contribution.tx_hash,
+      es.onopen = () => {
+        if (!isMounted) return;
+        setIsLive(true);
+        retryDelay = 1000;
+      };
+
+      es.onmessage = (e) => {
+        if (!isMounted) return;
+        let msg;
+        try {
+          msg = JSON.parse(e.data);
+        } catch {
+          return;
+        }
+
+        if (msg.type === "contribution") {
+          setCampaign((prev) =>
+            prev ? { ...prev, raised_amount: msg.raised_amount } : prev,
           );
-          if (exists) return current;
+          setContributions((prev) => {
+            const current = prev || [];
+            const exists = current.some(
+              (c) => c.tx_hash === msg.contribution.tx_hash,
+            );
+            if (exists) return current;
 
-          setTotalContributions((t) => t + 1);
+            setTotalContributions((t) => t + 1);
 
-          const updated = [msg.contribution, ...current];
-          if (!showAll && updated.length > 10) {
-            return updated.slice(0, 10);
-          }
-          return updated;
-        });
-      }
-    };
+            const updated = [msg.contribution, ...current];
+            if (!showAllRef.current && updated.length > 10) {
+              return updated.slice(0, 10);
+            }
+            return updated;
+          });
+        }
+      };
 
-    es.onerror = () => {
-      setIsLive(false);
-      es.close();
-    };
+      es.onerror = () => {
+        if (!isMounted) return;
+        setIsLive(false);
+        if (es) {
+          try {
+            es.close();
+          } catch {}
+          es = null;
+        }
+        scheduleReconnect();
+      };
+    }
+
+    function scheduleReconnect() {
+      if (!isMounted) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        connect();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+    }
+
+    connect();
 
     return () => {
-      es.close();
+      isMounted = false;
+      clearTimeout(reconnectTimer);
+      if (es) {
+        try {
+          es.close();
+        } catch {}
+        es = null;
+      }
       setIsLive(false);
     };
-  }, [id, showAll]);
+  }, [id]);
 
   useEffect(() => {
     if (location.state?.created) {
@@ -361,7 +432,7 @@ export default function Campaign() {
 
   async function handleClone() {
     try {
-      const data = await api.getCloneData(id, token);
+      const data = await api.getCloneData(id);
       navigate('/campaigns/new', { state: { prefill: data } });
     } catch (err) {
       alert(err.message || 'Failed to fetch campaign clone data');
@@ -378,7 +449,7 @@ export default function Campaign() {
     setInviteError("");
     setInviteSuccess(false);
     try {
-      const newMember = await api.inviteCampaignMember(id, inviteForm, token);
+      const newMember = await api.inviteCampaignMember(id, inviteForm);
       setMembers((prev) => [...prev, newMember]);
       setInviteForm({ email: "", role: "viewer" });
       setInviteSuccess(true);
@@ -395,7 +466,6 @@ export default function Campaign() {
         id,
         userId,
         { role: newRole },
-        token,
       );
       setMembers((prev) =>
         prev.map((m) =>
@@ -410,7 +480,7 @@ export default function Campaign() {
   async function handleRemoveMember(userId) {
     if (!confirm("Are you sure you want to remove this member?")) return;
     try {
-      await api.removeCampaignMember(id, userId, token);
+      await api.removeCampaignMember(id, userId);
       setMembers((prev) => prev.filter((m) => m.user_id !== userId));
     } catch (err) {
       alert(err.message || "Failed to remove member");
@@ -483,7 +553,7 @@ export default function Campaign() {
         return;
       }
 
-      const updated = await api.updateCampaign(campaign.id, updates, token);
+      const updated = await api.updateCampaign(campaign.id, updates);
       setCampaign(updated);
       setIsEditingCampaign(false);
       setEditFormData({ title: "", description: "", deadline: "" });
@@ -560,7 +630,7 @@ export default function Campaign() {
 
     try {
       setDeleteLoading(true);
-      await api.deleteCampaign(campaign.id, token);
+      await api.deleteCampaign(campaign.id);
       setShowDeleteDialog(false);
       setDeleteConfirmation("");
       // Redirect to home after successful deletion
@@ -624,11 +694,9 @@ export default function Campaign() {
     100,
     (campaign.raised_amount / campaign.target_amount) * 100,
   ).toFixed(1);
-  const currentUserId = user?.id || user?.userId;
-  const canPostUpdate =
-    currentUserId && String(campaign.creator_id) === String(currentUserId);
+  const canPostUpdate = isCampaignOwner(user, campaign);
   const campaignUrl = `${window.location.origin}/campaigns/${id}`;
-  const embedCode = `<iframe src="${window.location.origin}/widget/campaigns/${id}" width="320" height="120" frameborder="0" style="border-radius:10px"></iframe>`;
+  const embedCode = `<iframe src="${window.location.origin}/embed/campaigns/${id}" width="480" height="280" frameborder="0" title="CrowdPay campaign"></iframe>`;
 
   function canEditUpdate(update) {
     return (
@@ -778,7 +846,7 @@ export default function Campaign() {
       )}
       {campaign.status === "failed" &&
         user &&
-        user.id === campaign.creator_id && (
+        isCampaignOwner(user, campaign) && (
           <div
             style={{
               background: "var(--color-bg-card, #1e1e2f)",
@@ -1083,7 +1151,7 @@ export default function Campaign() {
       </div>
 
       {/* Edit campaign button - visible only to creator */}
-      {user && campaign && user.userId === campaign.creator_id && ['active', 'funded'].includes(campaign.status) && (
+      {isCampaignOwner(user, campaign) && ['active', 'funded'].includes(campaign.status) && (
         <div
           data-no-print
           style={{
@@ -1138,13 +1206,8 @@ export default function Campaign() {
           {showQR ? 'Hide QR code' : 'Show QR code'}
         </button>
         <div className="qr-wrapper" style={{ marginTop: '1rem', display: showQR ? 'flex' : 'none', justifyContent: 'center' }}>
-          <CampaignQRCode url={`${window.location.origin}/campaigns/${id}`} size={200} />
+          <CampaignQRCode url={campaignUrl} size={200} />
         </div>
-        {showQR && (
-          <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'center' }}>
-            <CampaignQRCode url={campaignUrl} size={200} />
-          </div>
-        )}
       </div>
 
       <details style={{ ...styles.card, marginTop: "-0.75rem" }}>
@@ -1172,7 +1235,7 @@ export default function Campaign() {
       {/* Report a problem — visible to contributors who have backed this campaign */}
       {user &&
         contributions?.some((c) => c.sender_public_key) &&
-        campaign.creator_id !== user.id && (
+        !isCampaignOwner(user, campaign) && (
           <div style={{ marginBottom: "1.25rem" }} data-no-print>
             {disputeSubmitted ? (
               <p className="alert alert--success" role="status">
@@ -1199,130 +1262,13 @@ export default function Campaign() {
             )}
           </div>
         )}
-      {canPostUpdate && (
-        <div style={styles.card} data-no-print>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginBottom: "1rem",
-            }}
-          >
-            <h3 style={{ margin: 0, fontSize: "1rem", fontWeight: 700 }}>
-              Embed this campaign
-            </h3>
-            <button
-              type="button"
-              onClick={() => setShowEmbedSection(!showEmbedSection)}
-              style={{
-                background: "transparent",
-                color: "var(--color-accent)",
-                border: "1px solid var(--color-accent)",
-                padding: "0.4rem 0.8rem",
-                fontSize: "0.85rem",
-                minHeight: "auto",
-              }}
-            >
-              {showEmbedSection ? "Hide" : "Show"}
-            </button>
-          </div>
 
-          {showEmbedSection && (
-            <>
-              <p
-                style={{
-                  fontSize: "0.85rem",
-                  color: "var(--color-text-hint)",
-                  marginBottom: "1rem",
-                  lineHeight: 1.5,
-                }}
-              >
-                Add this embed code to your website or blog to display a live
-                funding widget for this campaign.
-              </p>
-
-              <div style={{ marginBottom: "1rem" }}>
-                <label
-                  style={{
-                    fontSize: "0.8rem",
-                    fontWeight: 600,
-                    color: "var(--color-text-hint)",
-                    display: "block",
-                    marginBottom: "0.5rem",
-                  }}
-                >
-                  Embed code
-                </label>
-                <div style={{ position: "relative" }}>
-                  <pre style={styles.embedCode}>
-                    {`<iframe src="${window.location.origin}/embed/campaigns/${campaign.id}" \n        width="480" height="280" frameborder="0">\n</iframe>`}
-                  </pre>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const code = `<iframe src="${window.location.origin}/embed/campaigns/${campaign.id}" width="480" height="280" frameborder="0"></iframe>`;
-                      navigator.clipboard.writeText(code).then(() => {
-                        setEmbedCopied(true);
-                        setTimeout(() => setEmbedCopied(false), 2000);
-                      });
-                    }}
-                    style={{
-                      position: "absolute",
-                      top: "0.5rem",
-                      right: "0.5rem",
-                      background: embedCopied
-                        ? "var(--color-success-text)"
-                        : "var(--color-accent)",
-                      color: "#fff",
-                      padding: "0.4rem 0.8rem",
-                      fontSize: "0.8rem",
-                      minHeight: "auto",
-                    }}
-                  >
-                    {embedCopied ? "Copied!" : "Copy"}
-                  </button>
-                </div>
-              </div>
-
-              <div>
-                <label
-                  style={{
-                    fontSize: "0.8rem",
-                    fontWeight: 600,
-                    color: "var(--color-text-hint)",
-                    display: "block",
-                    marginBottom: "0.5rem",
-                  }}
-                >
-                  Preview
-                </label>
-                <div style={styles.embedPreview}>
-                  <iframe
-                    src={`/embed/campaigns/${campaign.id}`}
-                    width="100%"
-                    height="280"
-                    frameBorder="0"
-                    title="Campaign embed preview"
-                    style={{
-                      border: "1px solid var(--color-border-light)",
-                      borderRadius: "6px",
-                    }}
-                  />
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-      )}
-
-      {token && (
+      {user && (
         <div id="withdrawals" data-no-print>
         <WithdrawalsSection
           campaign={campaign}
           milestones={milestones}
           user={user}
-          token={token}
           onReleased={() => {
             api
               .getCampaign(id)
@@ -1339,7 +1285,7 @@ export default function Campaign() {
 
       <TransactionHistory
         campaignId={campaign.id}
-        isCreator={!!(user?.id && campaign.creator_id === user.id)}
+        isCreator={isCampaignOwner(user, campaign)}
       />
 
       <MilestoneTracker
@@ -1555,7 +1501,13 @@ export default function Campaign() {
             required
           />
           {updatesError && (
-            <div style={{ color: "var(--color-status-error)", fontSize: "0.85rem", marginTop: "0.5rem" }}>
+            <div
+              style={{
+                color: "var(--color-status-error)",
+                fontSize: "0.85rem",
+                marginTop: "0.5rem",
+              }}
+            >
               {updatesError}
             </div>
           )}
@@ -1565,17 +1517,17 @@ export default function Campaign() {
               className="btn-primary"
               disabled={updateBusy}
             >
-              {updateBusy ? "Saving..." : editingUpdateId ? "Save changes" : "Post"}
+              {updateBusy
+                ? "Saving..."
+                : editingUpdateId
+                  ? "Save update"
+                  : "Post update"}
             </button>
             {editingUpdateId && (
               <button
                 type="button"
                 className="btn-secondary"
-                onClick={() => {
-                  setEditingUpdateId(null);
-                  setUpdateForm({ title: "", body: "" });
-                  setUpdatesError("");
-                }}
+                onClick={cancelUpdateEdit}
               >
                 Cancel
               </button>
@@ -1583,6 +1535,21 @@ export default function Campaign() {
           </div>
         </form>
       )}
+
+      {updates.length === 0 ? (
+        <p
+          style={{ color: "var(--color-text-muted)", marginBottom: "1rem" }}
+        >
+          No updates yet — the creator hasn't posted anything.
+        </p>
+      ) : (
+        <div
+          style={{
+            display: "grid",
+            gap: "0.75rem",
+            marginBottom: "1.25rem",
+          }}
+        >
           {updates.map((update) => (
             <article key={update.id} className="campaign-card">
               <div
@@ -1604,6 +1571,7 @@ export default function Campaign() {
                   <RelativeTime date={update.created_at} />
                 </span>
               </div>
+
               <div
                 style={{
                   marginTop: "0.5rem",
@@ -1614,12 +1582,49 @@ export default function Campaign() {
                   __html: markdownToHtml(update.body),
                 }}
               />
+
+              {canPostUpdate && (
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "0.5rem",
+                    marginTop: "0.75rem",
+                  }}
+                >
+                  {canEditUpdate(update) && (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => startEditUpdate(update)}
+                      style={{
+                        fontSize: "0.85rem",
+                        padding: "0.4rem 0.75rem",
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => deleteUpdate(update.id)}
+                    style={{
+                      fontSize: "0.85rem",
+                      padding: "0.4rem 0.75rem",
+                      color: "var(--color-status-error)",
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              )}
             </article>
           ))}
-
+        </div>
+      )}
 
       {/* Analytics Section */}
-      {analytics && (
+      {isOwner && analytics && (
         <div style={{ marginBottom: "2rem" }}>
           <h2 style={styles.sectionTitle}>Analytics</h2>
           {!analytics.dailyTotals || analytics.dailyTotals.length === 0 ? (
@@ -1733,147 +1738,15 @@ export default function Campaign() {
         <div style={styles.emptyBackers}>
           <p>Be the first to back this!</p>
           <p
-            style={{ fontSize: "0.9rem", color: "var(--color-text-secondary)", marginTop: "0.25rem" }}
+            style={{
+              fontSize: "0.9rem",
+              color: "var(--color-text-secondary)",
+              marginTop: "0.25rem",
+            }}
           >
             Every contribution counts towards making this goal a reality.
           </p>
         </div>
-      ) : (
-        <>
-          <div style={styles.list} className="contributions-list">
-            {contributions.map((c) => (
-              <ContributionRow key={c.id} c={c} />
-            ))}
-          </div>
-          {totalContributions > 10 && (
-            <div style={{ display: 'flex', justifyContent: 'center', marginTop: '1rem' }}>
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => setShowAll((prev) => !prev)}
-                style={{ padding: '0.5rem 1.5rem', fontSize: '0.9rem', cursor: 'pointer' }}
-              >
-                <button
-                  type="submit"
-                  className="btn-primary"
-                  disabled={updateBusy}
-                >
-                  {updateBusy
-                    ? "Saving..."
-                    : editingUpdateId
-                      ? "Save update"
-                      : "Post update"}
-                </button>
-
-                {editingUpdateId && (
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    onClick={cancelUpdateEdit}
-                  >
-                    Cancel
-                  </button>
-                )}
-              </div>
-            </form>
-          )}
-
-          {updates.length === 0 ? (
-            <p
-              style={{ color: "var(--color-text-muted)", marginBottom: "1rem" }}
-            >
-              No updates yet — the creator hasn't posted anything.
-            </p>
-          ) : (
-            <div
-              style={{
-                display: "grid",
-                gap: "0.75rem",
-                marginBottom: "1.25rem",
-              }}
-            >
-              {updates.map((update) => (
-                <article key={update.id} className="campaign-card">
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: "0.5rem",
-                      flexWrap: "wrap",
-                    }}
-                  >
-                    <strong>{update.title}</strong>
-                    <span
-                      style={{
-                        color: "var(--color-text-hint)",
-                        fontSize: "0.85rem",
-                      }}
-                    >
-                      {update.author_name} •{" "}
-                      <RelativeTime date={update.created_at} />
-                    </span>
-                  </div>
-
-                  <div
-                    style={{
-                      marginTop: "0.5rem",
-                      color: "var(--color-text-primary)",
-                      lineHeight: 1.5,
-                    }}
-                    dangerouslySetInnerHTML={{
-                      __html: markdownToHtml(update.body),
-                    }}
-                  />
-
-                  {canPostUpdate && (
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: "0.5rem",
-                        marginTop: "0.75rem",
-                      }}
-                    >
-                      {canEditUpdate(update) && (
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => startEditUpdate(update)}
-                          style={{
-                            fontSize: "0.85rem",
-                            padding: "0.4rem 0.75rem",
-                          }}
-                        >
-                          Edit
-                        </button>
-                      )}
-
-
-          <h2 style={styles.sectionTitle}>
-            Backer Wall{" "}
-            {contributions !== null ? `(${totalContributions})` : ""}
-            {isLive && (
-              <span style={styles.liveIndicator} title="Live updates active">
-                <span style={styles.liveDot} />
-                Live
-              </span>
-            )}
-          </h2>
-
-          {contributions === null ? (
-            <ContributionListSkeleton />
-          ) : contributions.length === 0 ? (
-            <div style={styles.emptyBackers}>
-              <p>Be the first to back this!</p>
-              <p
-                style={{
-                  fontSize: "0.9rem",
-                  color: "var(--color-text-secondary)",
-                  marginTop: "0.25rem",
-                }}
-              >
-                Every contribution counts towards making this goal a reality.
-              </p>
-            </div>
       ) : (
         <>
           <div style={styles.list} className="contributions-list">
@@ -1902,9 +1775,9 @@ export default function Campaign() {
                 {showAll ? "Show less" : `Show all (${totalContributions})`}
               </button>
             </div>
-              )}
-            </>
           )}
+        </>
+      )}
 
 
       {showModal && (
@@ -1946,7 +1819,9 @@ export default function Campaign() {
         >
           <div
             style={{
-              background: "#fff",
+              background: "var(--color-surface)",
+              color: "var(--color-text-primary)",
+              border: "1px solid var(--color-border-light)",
               borderRadius: "12px",
               padding: "2rem",
               maxWidth: "500px",
@@ -1962,6 +1837,7 @@ export default function Campaign() {
                 marginTop: 0,
                 marginBottom: "1.5rem",
                 fontSize: "1.5rem",
+                color: "var(--color-text-primary)",
               }}
             >
               Edit Campaign
@@ -1970,10 +1846,10 @@ export default function Campaign() {
             {editError && (
               <p
                 style={{
-                  color: "#d32f2f",
+                  color: "var(--color-danger-text, #ef4444)",
                   marginBottom: "1rem",
                   padding: "0.75rem",
-                  background: "#ffebee",
+                  background: "var(--color-danger-bg, #fee2e2)",
                   borderRadius: "6px",
                 }}
               >
@@ -1987,6 +1863,7 @@ export default function Campaign() {
                   display: "block",
                   fontWeight: 600,
                   marginBottom: "0.5rem",
+                  color: "var(--color-text-primary)",
                 }}
               >
                 Title
@@ -2001,16 +1878,18 @@ export default function Campaign() {
                 style={{
                   width: "100%",
                   padding: "0.75rem",
-                  border: "1px solid #ddd",
+                  border: "1px solid var(--color-border-light)",
                   borderRadius: "6px",
                   fontSize: "1rem",
                   boxSizing: "border-box",
+                  background: "var(--color-bg)",
+                  color: "var(--color-text-primary)",
                 }}
               />
               <p
                 style={{
                   fontSize: "0.85rem",
-                  color: "#888",
+                  color: "var(--color-text-hint)",
                   margin: "0.25rem 0 0",
                 }}
               >
@@ -2024,6 +1903,7 @@ export default function Campaign() {
                   display: "block",
                   fontWeight: 600,
                   marginBottom: "0.5rem",
+                  color: "var(--color-text-primary)",
                 }}
               >
                 Description
@@ -2041,17 +1921,19 @@ export default function Campaign() {
                 style={{
                   width: "100%",
                   padding: "0.75rem",
-                  border: "1px solid #ddd",
+                  border: "1px solid var(--color-border-light)",
                   borderRadius: "6px",
                   fontSize: "1rem",
                   fontFamily: "inherit",
                   boxSizing: "border-box",
+                  background: "var(--color-bg)",
+                  color: "var(--color-text-primary)",
                 }}
               />
               <p
                 style={{
                   fontSize: "0.85rem",
-                  color: "#888",
+                  color: "var(--color-text-hint)",
                   margin: "0.25rem 0 0",
                 }}
               >
@@ -2065,6 +1947,7 @@ export default function Campaign() {
                   display: "block",
                   fontWeight: 600,
                   marginBottom: "0.5rem",
+                  color: "var(--color-text-primary)",
                 }}
               >
                 Deadline (optional)
@@ -2078,10 +1961,12 @@ export default function Campaign() {
                 style={{
                   width: "100%",
                   padding: "0.75rem",
-                  border: "1px solid #ddd",
+                  border: "1px solid var(--color-border-light)",
                   borderRadius: "6px",
                   fontSize: "1rem",
                   boxSizing: "border-box",
+                  background: "var(--color-bg)",
+                  color: "var(--color-text-primary)",
                 }}
               />
             </div>
@@ -2232,8 +2117,8 @@ export default function Campaign() {
                     deleteLoading || deleteConfirmation !== campaign.title
                       ? 0.6
                       : 1,
-                  background: "#dc2626",
-                  borderColor: "#dc2626",
+                  background: "var(--color-danger, #dc2626)",
+                  borderColor: "var(--color-danger, #dc2626)",
                 }}
               >
                 {deleteLoading ? "Deleting..." : "Delete Campaign"}
@@ -2247,128 +2132,6 @@ export default function Campaign() {
 }
 
 const styles = {
-  header: { marginBottom: "1.5rem" },
-  badgeRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    flexWrap: "wrap",
-  },
-  asset: {
-    background: "#ede9fe",
-    color: "#7c3aed",
-    fontSize: "0.75rem",
-    fontWeight: 700,
-    padding: "2px 8px",
-    borderRadius: "99px",
-  },
-  title: {
-    fontSize: "1.8rem",
-    fontWeight: 800,
-    margin: "0.5rem 0",
-    color: "#111",
-  },
-  creator: { color: "#666", fontSize: "0.9rem", marginBottom: "0.5rem" },
-  desc: { color: "#555", fontSize: "1rem", lineHeight: 1.6 },
-  card: {
-    background: "#fff",
-    border: "1px solid #e5e5e5",
-    borderRadius: "10px",
-    padding: "1.5rem",
-    marginBottom: "1rem",
-  },
-  amounts: {
-    display: "flex",
-    justifyContent: "space-between",
-    marginBottom: "1rem",
-  },
-  big: { fontSize: "1.5rem", fontWeight: 800, color: "#111" },
-  small: { fontSize: "0.85rem", color: "#888" },
-  bar: {
-    background: "#f0f0f0",
-    borderRadius: "99px",
-    height: "8px",
-    marginBottom: "1.25rem",
-    overflow: "hidden",
-  },
-  fill: { background: "#7c3aed", height: "100%", borderRadius: "99px" },
-  cta: { width: "100%", padding: "0.85rem", fontSize: "1rem" },
-  walletInfo: {
-    background: "#f8f8f8",
-    borderRadius: "8px",
-    padding: "0.75rem 1rem",
-    marginBottom: "1.75rem",
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.25rem",
-  },
-  walletLabel: {
-    fontSize: "0.75rem",
-    fontWeight: 600,
-    color: "#888",
-    textTransform: "uppercase",
-  },
-  walletKey: { fontSize: "0.8rem", color: "#555", wordBreak: "break-all" },
-  detailCoverImage: {
-    width: "100%",
-    borderRadius: "14px",
-    marginBottom: "1.5rem",
-    objectFit: "cover",
-    maxHeight: "360px",
-  },
-  detailCoverPlaceholder: {
-    width: "100%",
-    borderRadius: "14px",
-    marginBottom: "1.5rem",
-    height: "260px",
-    background: "linear-gradient(135deg, #ede9fe 0%, #e0e7ff 100%)",
-    border: "1px solid #ddd6fe",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  detailCoverPlaceholderText: { color: "#6d28d9", fontWeight: 700 },
-  sectionTitle: {
-    fontSize: "1.1rem",
-    fontWeight: 700,
-    marginBottom: "0.75rem",
-  },
-  list: { display: "flex", flexDirection: "column", gap: "0.5rem" },
-  row: {
-    display: "flex",
-    justifyContent: "space-between",
-    background: "#fff",
-    border: "1px solid #eee",
-    borderRadius: "6px",
-    padding: "0.6rem 0.85rem",
-  },
-  sender: { fontSize: "0.85rem", color: "#555", fontFamily: "monospace" },
-  amount: { fontSize: "0.85rem", fontWeight: 600, flexShrink: 0 },
-  convHint: { fontSize: "0.72rem", color: "#888", marginTop: "0.15rem" },
-  refundTag: {
-    marginTop: "0.45rem",
-    fontSize: "0.75rem",
-    color: "#7c3aed",
-    fontWeight: 700,
-  },
-  liveIndicator: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "4px",
-    marginLeft: "0.5rem",
-    fontSize: "0.72rem",
-    fontWeight: 600,
-    color: "#16a34a",
-    verticalAlign: "middle",
-  },
-  liveDot: {
-    display: "inline-block",
-    width: "7px",
-    height: "7px",
-    borderRadius: "50%",
-    background: "#16a34a",
-    animation: "pulse 1.5s ease-in-out infinite",
-  },
   header: { marginBottom: "1.5rem" },
   badgeRow: {
     display: "flex",
@@ -2458,6 +2221,18 @@ const styles = {
     objectFit: "cover",
     maxHeight: "360px",
   },
+  detailCoverPlaceholder: {
+    width: "100%",
+    borderRadius: "14px",
+    marginBottom: "1.5rem",
+    height: "260px",
+    background: "linear-gradient(135deg, var(--color-accent-lightest, #ede9fe) 0%, #e0e7ff 100%)",
+    border: "1px solid var(--color-accent-lighter, #ddd6fe)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  detailCoverPlaceholderText: { color: "var(--color-accent, #6d28d9)", fontWeight: 700 },
   sectionTitle: {
     fontSize: "1.1rem",
     fontWeight: 700,
@@ -2567,3 +2342,4 @@ const styles = {
     justifyContent: "center",
   },
 };
+

@@ -52,6 +52,67 @@ async function sendEmail({ to, subject, text, html }) {
   }
 }
 
+/**
+ * Fire-and-forget wrapper around sendEmail.
+ *
+ * Never throws — email failures are logged but do not propagate to callers.
+ * Use this at every call site where email is a non-critical side-effect so
+ * that an SMTP blip cannot cause unhandled promise rejections or crash the
+ * process.
+ *
+ * @param {object} opts  Same options as sendEmail ({ to, subject, text, html })
+ * @returns {Promise<void>}  Always resolves; errors are swallowed after logging.
+ */
+async function sendEmailSafe(opts) {
+  try {
+    await sendEmail(opts);
+  } catch (error) {
+    // Already logged inside sendEmail; log a secondary alert here with context.
+    console.error(
+      '[Email Service] sendEmailSafe swallowed error — email was NOT delivered.',
+      {
+        to: opts?.to,
+        subject: opts?.subject,
+        message: error?.message,
+      },
+    );
+  }
+}
+
+/**
+ * Records a send of `emailType` to `email` unless the address is suppressed
+ * (bounce/complaint) or the same type was sent within `cooldownMs`.
+ *
+ * @returns {Promise<boolean>} true when the caller may send the email.
+ */
+async function reserveEmailSend(email, emailType, cooldownMs) {
+  const { rows } = await db.query(
+    `INSERT INTO email_send_log (email, email_type)
+     SELECT $1, $2
+     WHERE NOT EXISTS (
+         SELECT 1 FROM email_suppressions WHERE email = LOWER($1)
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM email_send_log
+         WHERE LOWER(email) = LOWER($1)
+           AND email_type = $2
+           AND sent_at > NOW() - ($3::int * INTERVAL '1 millisecond')
+       )
+     RETURNING id`,
+    [email, emailType, cooldownMs],
+  );
+  return rows.length > 0;
+}
+
+async function suppressEmail(email, reason) {
+  await db.query(
+    `INSERT INTO email_suppressions (email, reason)
+     VALUES (LOWER($1), $2)
+     ON CONFLICT (email) DO NOTHING`,
+    [email, reason],
+  );
+}
+
 function getStellarExpertTxUrl(txHash) {
   const network = process.env.STELLAR_NETWORK || "testnet";
   return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
@@ -110,5 +171,8 @@ async function sendContributionReceipt({
 
 module.exports = {
   sendEmail,
+  sendEmailSafe,
+  reserveEmailSend,
+  suppressEmail,
   sendContributionReceipt,
 };

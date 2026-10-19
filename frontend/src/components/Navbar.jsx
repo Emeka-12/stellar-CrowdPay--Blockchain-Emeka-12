@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../context/AuthContext';
 import { api } from '../services/api';
+import NotificationDropdown from './NotificationDropdown';
 
 export default function Navbar() {
   const { user, logout } = useAuth();
@@ -14,6 +15,7 @@ export default function Navbar() {
   const [notifications, setNotifications] = useState([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const bellRef = useRef(null);
+  const bellBtnRef = useRef(null);
 
   const unread = notifications.filter((n) => !n.read_at).length;
 
@@ -36,9 +38,28 @@ export default function Navbar() {
         setShowDropdown(false);
       }
     }
+    function handleKey(e) {
+      if (e.key === 'Escape') {
+        setShowDropdown(false);
+        bellBtnRef.current?.focus();
+      }
+    }
     document.addEventListener('mousedown', handleOutside);
-    return () => document.removeEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleKey);
+    };
   }, [showDropdown]);
+
+  function handleMarkRead(id) {
+    setNotifications((prev) => prev.map((n) => n.id === id ? { ...n, read_at: new Date().toISOString() } : n));
+  }
+
+  async function handleMarkAllRead() {
+    await api.markAllNotificationsRead().catch(() => {});
+    setNotifications((prev) => prev.map((n) => ({ ...n, read_at: n.read_at || new Date().toISOString() })));
+  }
 
   function handleLogout() {
     logout();
@@ -75,10 +96,44 @@ export default function Navbar() {
               >
                 {t('nav.startCampaign')}
               </Link>
+              <Link
+                to="/dashboard"
+                style={styles.link}
+                aria-current={pathname === '/dashboard' ? 'page' : undefined}
+              >
+                Dashboard
+              </Link>
+              <Link
+                to="/developer"
+                style={styles.link}
+                aria-current={pathname === '/developer' ? 'page' : undefined}
+              >
+                Developer
+              </Link>
+              <Link
+                to="/profile"
+                style={styles.link}
+                aria-current={pathname === '/profile' ? 'page' : undefined}
+              >
+                Settings
+              </Link>
+              {(user.role === 'admin' || user.is_admin) && (
+                <Link
+                  to="/admin"
+                  style={styles.link}
+                  aria-current={pathname === '/admin' ? 'page' : undefined}
+                >
+                  Admin
+                </Link>
+              )}
               <span style={styles.name} aria-hidden="true">{user.name}</span>
               <div style={styles.bellWrap} ref={bellRef}>
                 <button
+                  ref={bellBtnRef}
                   onClick={() => setShowDropdown((v) => !v)}
+                  aria-haspopup="menu"
+                  aria-expanded={showDropdown}
+                  aria-controls="notification-menu"
                   style={styles.bellBtn}
                   aria-label={`${unread} unread notifications`}
                 >

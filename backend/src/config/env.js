@@ -3,11 +3,22 @@ const { validateWalletSecretConfig } = require('../services/walletSecrets');
 const REQUIRED = [
   'DATABASE_URL',
   'JWT_SECRET',
+  'API_KEY_PEPPER',
   'PLATFORM_SECRET_KEY',
   'STELLAR_NETWORK',
   'STELLAR_HORIZON_URL',
+  'USDC_ISSUER',
 ];
 const STORAGE_VARS = ['STORAGE_BUCKET', 'STORAGE_ENDPOINT'];
+
+// Published in backend/.env.example (and CI) so local dev boots out of the box.
+// They must never reach production or mainnet.
+const DEV_ONLY_VALUES = {
+  JWT_SECRET: 'dev-only-jwt-secret-change-me',
+  API_KEY_PEPPER: 'dev-only-api-key-pepper-change-me',
+  PLATFORM_SECRET_KEY: 'SCVMQUS5EMTHWBLJTE5XCSCMHB2ZOVKRR4ATVTRPUNRCOGKRENIL3LHR',
+  WALLET_SECRET_LOCAL_KEK: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+};
 
 function validateEnv() {
   const missing = REQUIRED.filter((key) => !process.env[key]);
@@ -27,6 +38,17 @@ function validateEnv() {
       `\n[crowdpay] Cannot start: incomplete storage configuration. Set all of:\n${STORAGE_VARS.join(', ')}\n\nMissing:\n${list}\n\n`
     );
     process.exit(1);
+  }
+
+  if (process.env.NODE_ENV === 'production' || process.env.STELLAR_NETWORK === 'mainnet') {
+    const devOnly = Object.keys(DEV_ONLY_VALUES).filter((key) => process.env[key] === DEV_ONLY_VALUES[key]);
+    if (devOnly.length) {
+      const list = devOnly.map((k) => `  - ${k}`).join('\n');
+      process.stderr.write(
+        `\n[crowdpay] Cannot start: these variables still use the published development values from .env.example:\n${list}\n\n`
+      );
+      process.exit(1);
+    }
   }
 
   try {
@@ -49,4 +71,4 @@ function validateEnv() {
   }
 }
 
-module.exports = { validateEnv };
+module.exports = { validateEnv, REQUIRED, DEV_ONLY_VALUES };

@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const db = require('../config/database');
 const logger = require('../config/logger');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requireAdmin, requireSuperAdmin } = require('../middleware/auth');
 const { reconcileSingleCampaign } = require('../services/reconciliation');
 const cache = require('../utils/cache');
 
@@ -51,6 +51,18 @@ router.get('/stats', async (req, res) => {
 });
 
 /**
+ * GET /api/admin/metrics/db-pool
+ * Database connection pool metrics
+ */
+router.get('/metrics/db-pool', (req, res) => {
+  res.json({
+    total: db.totalCount,
+    idle: db.idleCount,
+    waiting: db.waitingCount,
+  });
+});
+
+/**
  * GET /api/admin/campaigns
  * List all campaigns with filters
  */
@@ -84,6 +96,29 @@ router.get('/campaigns', async (req, res) => {
   } catch (err) {
     logger.error('Error fetching campaigns for admin', { error: err.message });
     res.status(500).json({ error: 'Failed to fetch campaigns' });
+  }
+});
+
+/**
+ * GET /api/admin/campaigns/deleted
+ * List only deleted campaigns
+ */
+router.get('/campaigns/deleted', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT c.id, c.title, c.status, c.raised_amount, c.target_amount, 
+              c.asset_type, c.created_at, c.deleted_at,
+              u.id as creator_id, u.name as creator_name, u.email as creator_email,
+              (SELECT COUNT(*) FROM contributions WHERE campaign_id = c.id) as contribution_count
+       FROM campaigns c 
+       JOIN users u ON c.creator_id = u.id
+       WHERE c.deleted_at IS NOT NULL
+       ORDER BY c.deleted_at DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    logger.error('Error fetching deleted campaigns for admin', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch deleted campaigns' });
   }
 });
 
@@ -129,14 +164,14 @@ router.patch('/campaigns/:id/suspend', async (req, res) => {
 
 /**
  * PATCH /api/admin/campaigns/:id/restore
- * Restore a suspended campaign to active
+ * Restore a suspended campaign to active, or restore a soft-deleted campaign
  */
 router.patch('/campaigns/:id/restore', async (req, res) => {
   try {
     const { id } = req.params;
 
     const { rows: campaignRows } = await db.query(
-      'SELECT id, status FROM campaigns WHERE id = $1 AND deleted_at IS NULL',
+      'SELECT id, status, deleted_at FROM campaigns WHERE id = $1',
       [id]
     );
 
@@ -146,8 +181,26 @@ router.patch('/campaigns/:id/restore', async (req, res) => {
 
     const campaign = campaignRows[0];
 
+    // Handle soft-deleted campaign restoration
+    if (campaign.deleted_at) {
+      const { rows: updated } = await db.query(
+        `UPDATE campaigns SET deleted_at = NULL, status = 'active' WHERE id = $1 RETURNING id, title, status, deleted_at`,
+        [id]
+      );
+
+      await logAdminAction(req.user.userId, 'restore', 'campaign', id, { 
+        restored_from: 'deleted'
+      });
+
+      logger.info('Soft-deleted campaign restored', { campaignId: id, adminId: req.user.userId });
+      cache.invalidate(`campaigns:id:${id}`);
+      cache.invalidatePrefix('campaigns:list:');
+      return res.json({ message: 'Campaign restored from deleted', campaign: updated[0] });
+    }
+
+    // Handle suspended campaign restoration
     if (campaign.status !== 'suspended') {
-      return res.status(400).json({ error: 'Only suspended campaigns can be restored' });
+      return res.status(400).json({ error: 'Only suspended or deleted campaigns can be restored' });
     }
 
     const { rows: updated } = await db.query(
@@ -297,7 +350,8 @@ router.get('/users', async (req, res) => {
     const { rows } = await db.query(
       `SELECT u.id, u.name, u.email, u.role, u.is_admin, u.is_banned, u.created_at,
               (SELECT COUNT(*) FROM campaigns WHERE creator_id = u.id AND deleted_at IS NULL) as campaign_count,
-              (SELECT COUNT(*) FROM contributions WHERE sender_public_key = u.wallet_public_key) as contribution_count
+              (SELECT COUNT(*) FROM contributions WHERE sender_public_key = u.wallet_public_key
+                 OR sender_public_key IN (SELECT public_key FROM user_wallet_keys WHERE user_id = u.id)) as contribution_count
        FROM users u
        ${where}
        ORDER BY u.created_at DESC`,
@@ -399,18 +453,25 @@ router.patch('/users/:id/unban', async (req, res) => {
  */
 router.get('/audit-log', async (req, res) => {
   try {
-    const { limit = 100, offset = 0 } = req.query;
-    const limitNum = Math.min(parseInt(limit) || 100, 1000);
-    const offsetNum = parseInt(offset) || 0;
+    const { limit = 100, offset = 0, before_id: beforeId } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 100, 100);
+    const offsetNum = beforeId ? 0 : parseInt(offset) || 0;
 
+    if (beforeId && !/^[0-9a-f-]{36}$/i.test(beforeId)) {
+      return res.status(400).json({ error: 'before_id must be a UUID' });
+    }
+
+    // Keyset pagination: pass the last row's id as before_id to fetch the next page.
     const { rows } = await db.query(
       `SELECT a.id, a.admin_user_id, u.email as admin_email, a.action_type, 
               a.target_type, a.target_id, a.details, a.created_at
        FROM admin_actions a
        JOIN users u ON a.admin_user_id = u.id
-       ORDER BY a.created_at DESC
+       WHERE $3::uuid IS NULL
+          OR (a.created_at, a.id) < (SELECT created_at, id FROM admin_actions WHERE id = $3::uuid)
+       ORDER BY a.created_at DESC, a.id DESC
        LIMIT $1 OFFSET $2`,
-      [limitNum, offsetNum]
+      [limitNum, offsetNum, beforeId || null]
     );
 
     const { rows: countRows } = await db.query('SELECT COUNT(*) FROM admin_actions');
@@ -421,7 +482,8 @@ router.get('/audit-log', async (req, res) => {
       pagination: {
         limit: limitNum,
         offset: offsetNum,
-        total: total
+        total: total,
+        next_before_id: rows.length === limitNum ? rows[rows.length - 1].id : null,
       }
     });
   } catch (err) {
@@ -432,9 +494,9 @@ router.get('/audit-log', async (req, res) => {
 
 /**
  * PATCH /api/admin/users/:id/promote
- * Promote a user to admin
+ * Promote a user to admin — only super-admins may do this.
  */
-router.patch('/users/:id/promote', async (req, res) => {
+router.patch('/users/:id/promote', requireSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -470,11 +532,17 @@ router.patch('/users/:id/promote', async (req, res) => {
 
 /**
  * PATCH /api/admin/users/:id/demote
- * Demote an admin to regular user
+ * Demote an admin to regular user — only super-admins may do this.
+ * Self-demotion is blocked. Demoting the last admin is blocked.
  */
-router.patch('/users/:id/demote', async (req, res) => {
+router.patch('/users/:id/demote', requireSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+
+    // Block self-demotion
+    if (String(id) === String(req.user.userId)) {
+      return res.status(403).json({ error: 'You cannot demote yourself' });
+    }
 
     const { rows: userRows } = await db.query(
       'SELECT id, email, is_admin FROM users WHERE id = $1',
@@ -489,6 +557,16 @@ router.patch('/users/:id/demote', async (req, res) => {
 
     if (!user.is_admin) {
       return res.status(400).json({ error: 'User is not an admin' });
+    }
+
+    // Quorum guard: ensure at least one admin (besides the target) will remain
+    const { rows: adminCountRows } = await db.query(
+      `SELECT COUNT(*) FROM users WHERE is_admin = true AND id != $1`,
+      [id]
+    );
+    const remainingAdmins = parseInt(adminCountRows[0].count, 10);
+    if (remainingAdmins < 1) {
+      return res.status(409).json({ error: 'Cannot demote the last admin — the platform would be locked out' });
     }
 
     const { rows: updated } = await db.query(
@@ -548,6 +626,74 @@ router.post('/campaigns/:id/reconcile', async (req, res) => {
     }
     logger.error('Error during manual reconciliation', { error: err.message, campaignId: req.params.id });
     res.status(500).json({ error: 'Failed to reconcile campaign' });
+  }
+});
+
+/**
+ * GET /api/admin/refund-queue
+ * List all pending refunds awaiting approval with SLA tracking
+ */
+router.get('/refund-queue', async (req, res) => {
+  try {
+    const { status, overdue_only, limit = 50, offset = 0 } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 50, 200);
+    const offsetNum = parseInt(offset) || 0;
+
+    let where = `WHERE wr.is_refund = true`;
+    const params = [];
+
+    if (status) {
+      params.push(status);
+      where += ` AND wr.status = $${params.length}`;
+    }
+
+    // Add overdue filter: refunds older than 7 days with status 'pending' or 'on_hold'
+    if (overdue_only === 'true') {
+      where += ` AND wr.status IN ('pending', 'on_hold') AND wr.created_at < NOW() - INTERVAL '7 days'`;
+    }
+
+    const { rows } = await db.query(
+      `SELECT wr.id, wr.campaign_id, wr.amount, wr.asset, wr.destination_key, wr.status,
+              wr.is_refund, wr.dispute_id, wr.created_at, wr.creator_signed, wr.platform_signed,
+              c.title as campaign_title,
+              u.email as contributor_email,
+              CASE
+                WHEN wr.status IN ('pending', 'on_hold') AND wr.created_at < NOW() - INTERVAL '7 days'
+                THEN true
+                ELSE false
+              END as is_overdue,
+              EXTRACT(EPOCH FROM (NOW() - wr.created_at)) / 86400 as days_pending
+       FROM withdrawal_requests wr
+       JOIN campaigns c ON c.id = wr.campaign_id
+       LEFT JOIN users u ON u.wallet_public_key = wr.destination_key
+       ${where}
+       ORDER BY wr.created_at ASC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limitNum, offsetNum]
+    );
+
+    const { rows: countRows } = await db.query(
+      `SELECT COUNT(*) FROM withdrawal_requests wr ${where}`,
+      params
+    );
+    const total = parseInt(countRows[0].count);
+
+    res.json({
+      refunds: rows.map(r => ({
+        ...r,
+        amount: parseFloat(r.amount),
+        days_pending: parseFloat(r.days_pending.toFixed(2)),
+        is_overdue: r.is_overdue,
+      })),
+      pagination: {
+        limit: limitNum,
+        offset: offsetNum,
+        total,
+      },
+    });
+  } catch (err) {
+    logger.error('Error fetching refund queue', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch refund queue' });
   }
 });
 

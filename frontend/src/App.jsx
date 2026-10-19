@@ -19,6 +19,7 @@ import NotFound from './pages/NotFound';
 import { AuthProvider } from './context/AuthContext';
 import { ThemeProvider } from './context/ThemeContext';
 import { ToastProvider } from './context/ToastContext';
+import { DialogProvider } from './context/DialogContext';
 
 export default function App() {
   const location = useLocation();
@@ -28,6 +29,7 @@ export default function App() {
     <ThemeProvider>
       <AuthProvider>
         <ToastProvider>
+        <DialogProvider>
         {!hideNavbar && <Navbar />}
         <Routes>
           <Route path="/" element={<Home />} />
@@ -47,6 +49,7 @@ export default function App() {
           <Route path="/my-contributions" element={<Navigate to="/dashboard?tab=contributions" replace />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
+        </DialogProvider>
         </ToastProvider>
       </AuthProvider>
     </ThemeProvider>

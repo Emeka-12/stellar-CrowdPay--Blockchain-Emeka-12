@@ -7,7 +7,7 @@ const { Keypair } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { ensureCustodialAccountFundedAndTrusted } = require('../services/stellarService');
-const { sendEmail } = require('../services/emailService');
+const { sendEmail, sendEmailSafe, reserveEmailSend } = require('../services/emailService');
 const { requireAuth } = require('../middleware/auth');
 const { encryptWalletSecret } = require('../services/walletSecrets');
 const { isKycRequiredForCampaigns } = require('../services/kycProvider');
@@ -19,6 +19,7 @@ const {
   validateRequest,
   validateRequestAsError,
 } = require('../middleware/validation');
+const asyncHandler = require('../utils/asyncHandler');
 
 /**
  * @openapi
@@ -28,9 +29,13 @@ const {
  */
 
 const ACCESS_TOKEN_COOKIE_NAME = 'cp_token';
-const REFRESH_TOKEN_COOKIE_NAME = 'cp_refresh_token';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// __Host- binds the cookie to this exact host (no Domain, Path=/, Secure), blocking
+// subdomain cookie tossing. Browsers only accept it over HTTPS, so it is production-only.
+const REFRESH_TOKEN_COOKIE_NAME = IS_PRODUCTION ? '__Host-cp_refresh' : 'cp_refresh_token';
 const REFRESH_TOKEN_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+const PASSWORD_RESET_EMAIL_COOLDOWN_MS = 5 * 60 * 1000;
 const FORGOT_PASSWORD_MESSAGE =
   'If that email exists, a password reset link has been sent.';
 
@@ -91,7 +96,7 @@ function getFrontendUrl() {
 
 function generateTokens(user) {
   const accessToken = jwt.sign(
-    { userId: user.id, role: user.role },
+    { userId: user.id, role: user.role, tv: user.token_version ?? 0 },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
   );
@@ -102,8 +107,9 @@ function generateTokens(user) {
 function setRefreshTokenCookie(res, token, expiresAt) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: IS_PRODUCTION,
+    sameSite: 'strict',
+    path: '/',
     maxAge: REFRESH_TOKEN_COOKIE_MAX_AGE,
     expires: expiresAt,
   });
@@ -112,23 +118,33 @@ function setRefreshTokenCookie(res, token, expiresAt) {
 function clearRefreshTokenCookie(res) {
   res.cookie(REFRESH_TOKEN_COOKIE_NAME, '', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: IS_PRODUCTION,
+    sameSite: 'strict',
+    path: '/',
     maxAge: 0,
     expires: new Date(0),
   });
 }
 
-async function createRefreshToken(userId) {
+async function createRefreshToken(userId, familyId = null) {
   const expiresInSeconds = parseRefreshExpiresIn(process.env.REFRESH_TOKEN_EXPIRES_IN || '7d');
   const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashToken(token);
-  await db.query(
-    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
-    [userId, tokenHash, expiresAt]
-  );
-  return { token, expiresAt };
+  const resolvedFamilyId = familyId || crypto.randomUUID();
+  try {
+    await db.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id, token_version)
+       SELECT $1, $2, $3, $4, COALESCE(token_version, 0) FROM users WHERE id = $1`,
+      [userId, tokenHash, expiresAt, resolvedFamilyId]
+    );
+  } catch {
+    await db.query(
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id) VALUES ($1, $2, $3, $4)`,
+      [userId, tokenHash, expiresAt, resolvedFamilyId]
+    );
+  }
+  return { token, expiresAt, familyId: resolvedFamilyId };
 }
 
 function parseRefreshExpiresIn(value) {
@@ -142,16 +158,73 @@ function parseRefreshExpiresIn(value) {
 
 async function validateRefreshToken(token) {
   const tokenHash = hashToken(token);
-  const { rows } = await db.query(
-    `SELECT rt.id, rt.user_id, u.id AS id, u.email, u.name, u.role, u.wallet_public_key,
-            u.kyc_status, u.kyc_completed_at
-     FROM refresh_tokens rt
-     JOIN users u ON u.id = rt.user_id
-     WHERE rt.token_hash = $1 AND rt.revoked_at IS NULL AND rt.expires_at > NOW()`,
-    [tokenHash]
-  );
+  let rows;
+  try {
+    const res = await db.query(
+      `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at, rt.token_version AS rt_token_version,
+              u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
+              u.kyc_status, u.kyc_completed_at, u.token_version
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1`,
+      [tokenHash]
+    );
+    rows = res.rows;
+  } catch {
+    const res = await db.query(
+      `SELECT rt.id AS token_id, rt.user_id, rt.family_id, rt.revoked_at, rt.expires_at,
+              u.id AS id, u.email, u.name, u.role, u.wallet_public_key, u.wallet_type,
+              u.kyc_status, u.kyc_completed_at, u.token_version
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1`,
+      [tokenHash]
+    );
+    rows = res.rows;
+  }
   if (!rows.length) return null;
-  return rows[0];
+  const rt = rows[0];
+
+  if (rt.revoked_at) {
+    logger.warn('Refresh token reuse detected, revoking session family', {
+      user_id: rt.user_id,
+      family_id: rt.family_id,
+      token_id: rt.token_id,
+    });
+    if (rt.family_id) {
+      await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE family_id = $1 AND revoked_at IS NULL`,
+        [rt.family_id]
+      );
+    } else {
+      await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
+        [rt.user_id]
+      );
+    }
+    return { reuseDetected: true, user_id: rt.user_id, family_id: rt.family_id };
+  }
+
+  // Reject refresh tokens invalidated by password reset (stale token_version)
+  if (rt.rt_token_version !== undefined && rt.rt_token_version !== null) {
+    if (rt.rt_token_version < (rt.token_version ?? 0)) {
+      logger.warn('Refresh token invalidated by password reset', {
+        user_id: rt.user_id,
+        family_id: rt.family_id,
+      });
+      await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`,
+        [rt.token_id]
+      );
+      return null;
+    }
+  }
+
+  if (new Date(rt.expires_at) <= new Date()) {
+    return null;
+  }
+
+  return rt;
 }
 
 async function revokeRefreshToken(token) {
@@ -162,12 +235,12 @@ async function revokeRefreshToken(token) {
   );
 }
 
-async function rotateRefreshToken(oldToken, userId) {
+async function rotateRefreshToken(oldToken, userId, familyId = null) {
   await revokeRefreshToken(oldToken);
-  return createRefreshToken(userId);
+  return createRefreshToken(userId, familyId);
 }
 
-router.post('/register', registerLimiter, registerValidation, validateRequest, async (req, res) => {
+router.post('/register', registerLimiter, registerValidation, validateRequest, asyncHandler(async (req, res) => {
   /**
    * @openapi
    * /api/auth/register:
@@ -215,25 +288,6 @@ router.post('/register', registerLimiter, registerValidation, validateRequest, a
    *               type: object
    *               properties:
    *                 error: { type: string }
-   * /api/users/register:
-   *   post:
-   *     tags: [Users]
-   *     summary: Register a new user (alias of /api/auth/register)
-   *     requestBody:
-   *       required: true
-   *       content:
-   *         application/json:
-   *           schema:
-   *             type: object
-   *             required: [email, password, name]
-   *             properties:
-   *               email: { type: string, format: email }
-   *               password: { type: string, minLength: 6 }
-   *               name: { type: string }
-   *               role: { type: string, enum: [contributor, creator] }
-   *     responses:
-   *       201: { description: Created }
-   *       409: { description: Email already registered }
    */
   const { email, password, name, role } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -255,11 +309,15 @@ router.post('/register', registerLimiter, registerValidation, validateRequest, a
   let publicKey;
   let encryptedSecret = null;
   let secret = null;
-  let walletType = req.body.wallet_type || 'custodial';
+  const walletType = req.body.wallet_type || 'custodial';
 
   if (walletType === 'freighter') {
     publicKey = req.body.wallet_public_key;
-    // wallet_public_key validated by middleware when wallet_type=freighter
+    try {
+      Keypair.fromPublicKey(publicKey);
+    } catch (_err) {
+      return res.status(400).json({ error: 'A valid wallet_public_key is required for Freighter registration' });
+    }
     encryptedSecret = null;
   } else {
     const keypair = Keypair.random();
@@ -285,7 +343,16 @@ router.post('/register', registerLimiter, registerValidation, validateRequest, a
   setRefreshTokenCookie(res, refreshToken, expiresAt);
   setAccessTokenCookie(res, accessToken);
 
+  // Generate email verification token
+  const verificationToken = crypto.randomBytes(32).toString('hex');
+  await db.query(
+    `UPDATE users SET verification_token = $1, verification_sent_at = NOW()
+     WHERE id = $2`,
+    [verificationToken, user.id]
+  );
+
   const requestId = req.id;
+  const verifyUrl = `${getFrontendUrl()}/verify-email?token=${verificationToken}`;
   setImmediate(() => {
     // Only fund and setup trustlines for custodial wallets
     if (walletType === 'custodial' && secret) {
@@ -297,17 +364,20 @@ router.post('/register', registerLimiter, registerValidation, validateRequest, a
       });
     }
 
-    sendEmail({
+    sendEmailSafe({
       to: normalizedEmail,
-      subject: 'Welcome to CrowdPay!',
-      text: `Welcome ${normalizedName}! Your custodial wallet public key is ${publicKey}.`
+      subject: 'Verify your CrowdPay email address',
+      text: `Welcome to CrowdPay, ${normalizedName}!\n\nPlease verify your email address by opening this link:\n\n${verifyUrl}\n\nThis link is valid for 24 hours.\n\nIf you did not create this account, you can ignore this email.`,
+      html: `<p>Welcome to CrowdPay, ${normalizedName}!</p><p>Please <a href="${verifyUrl}">verify your email address</a> to unlock all features (creating campaigns, withdrawals, etc.).</p><p>This link is valid for 24 hours.</p><p>If you did not create this account, you can ignore this email.</p>`,
+    }).catch((err) => {
+      logger.error('Verification email send failed', { request_id: requestId, error: err.message });
     });
   });
 
   res.status(201).json({ token: accessToken, user });
-});
+}));
 
-router.post('/login', loginLimiter, loginValidation, validateRequest, async (req, res) => {
+router.post('/login', loginLimiter, loginValidation, validateRequest, asyncHandler(async (req, res) => {
   /**
    * @openapi
    * /api/auth/login:
@@ -353,23 +423,6 @@ router.post('/login', loginLimiter, loginValidation, validateRequest, async (req
    *               type: object
    *               properties:
    *                 error: { type: string }
-   * /api/users/login:
-   *   post:
-   *     tags: [Users]
-   *     summary: Login (alias of /api/auth/login)
-   *     requestBody:
-   *       required: true
-   *       content:
-   *         application/json:
-   *           schema:
-   *             type: object
-   *             required: [email, password]
-   *             properties:
-   *               email: { type: string, format: email }
-   *               password: { type: string }
-   *     responses:
-   *       200: { description: OK }
-   *       401: { description: Invalid credentials }
    */
   const { email, password } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -400,21 +453,27 @@ router.post('/login', loginLimiter, loginValidation, validateRequest, async (req
       kyc_required_for_campaigns: isKycRequiredForCampaigns(),
     },
   });
-});
+}));
 
-router.post('/refresh', async (req, res) => {
+router.post('/refresh', asyncHandler(async (req, res) => {
   const token = req.cookies?.[REFRESH_TOKEN_COOKIE_NAME];
   if (!token) {
     return res.status(401).json({ error: 'No refresh token provided' });
   }
 
   const user = await validateRefreshToken(token);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid or expired refresh token' });
+  if (!user || user.reuseDetected) {
+    clearRefreshTokenCookie(res);
+    clearAccessTokenCookie(res);
+    return res.status(401).json({
+      error: user?.reuseDetected
+        ? 'Refresh token reuse detected; session revoked'
+        : 'Invalid or expired refresh token',
+    });
   }
 
   const { accessToken } = generateTokens(user);
-  const { token: newRefreshToken, expiresAt } = await rotateRefreshToken(token, user.id);
+  const { token: newRefreshToken, expiresAt } = await rotateRefreshToken(token, user.id, user.family_id);
 
   setRefreshTokenCookie(res, newRefreshToken, expiresAt);
   setAccessTokenCookie(res, accessToken);
@@ -432,9 +491,9 @@ router.post('/refresh', async (req, res) => {
       kyc_required_for_campaigns: isKycRequiredForCampaigns(),
     },
   });
-});
+}));
 
-router.post('/logout', async (req, res) => {
+router.post('/logout', asyncHandler(async (req, res) => {
   const token = req.cookies?.[REFRESH_TOKEN_COOKIE_NAME];
   if (token) {
     await revokeRefreshToken(token);
@@ -442,6 +501,151 @@ router.post('/logout', async (req, res) => {
   clearRefreshTokenCookie(res);
   clearAccessTokenCookie(res);
   res.json({ ok: true });
+}));
+
+// Email verification TTL: 24 hours
+const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const RESEND_COOLDOWN_MS = 60 * 1000; // 1 minute between resend attempts
+
+const resendVerificationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: isTest ? 100000 : 5,
+  message: { error: 'Too many verification requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => isTest,
+});
+
+/**
+ * @openapi
+ * /api/auth/verify-email:
+ *   post:
+ *     tags: [Users]
+ *     summary: Verify email address using the token sent at registration
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [token]
+ *             properties:
+ *               token: { type: string }
+ *     responses:
+ *       200: { description: Email verified }
+ *       400: { description: Invalid or expired token }
+ */
+router.post('/verify-email', async (req, res) => {
+  const { token } = req.body || {};
+  if (!token) {
+    return res.status(400).json({ error: 'Verification token is required' });
+  }
+
+  const { rows } = await db.query(
+    `SELECT id, email_verified, verification_sent_at
+     FROM users
+     WHERE verification_token = $1`,
+    [token]
+  );
+
+  if (!rows.length) {
+    return res.status(400).json({ error: 'Invalid or expired verification link.' });
+  }
+
+  const user = rows[0];
+
+  if (user.email_verified) {
+    return res.json({ message: 'Email already verified.' });
+  }
+
+  const sentAt = user.verification_sent_at ? new Date(user.verification_sent_at) : null;
+  if (!sentAt || Date.now() - sentAt.getTime() > EMAIL_VERIFICATION_TTL_MS) {
+    return res.status(400).json({
+      error: 'Verification link has expired. Please request a new one.',
+      code: 'VERIFICATION_EXPIRED',
+    });
+  }
+
+  await db.query(
+    `UPDATE users
+     SET email_verified = true,
+         verification_token = NULL,
+         verification_sent_at = NULL
+     WHERE id = $1`,
+    [user.id]
+  );
+
+  res.json({ message: 'Email verified successfully. You can now create campaigns.' });
+});
+
+/**
+ * @openapi
+ * /api/auth/resend-verification:
+ *   post:
+ *     tags: [Users]
+ *     summary: Resend the email verification link
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Verification email sent }
+ *       400: { description: Email already verified or cooldown active }
+ *       401: { description: Unauthorized }
+ */
+router.post('/resend-verification', resendVerificationLimiter, requireAuth, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT id, email, name, email_verified, verification_sent_at
+     FROM users
+     WHERE id = $1`,
+    [req.user.userId]
+  );
+
+  if (!rows.length) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  const user = rows[0];
+
+  if (user.email_verified) {
+    return res.status(400).json({ error: 'Email is already verified.' });
+  }
+
+  // Enforce cooldown to prevent spam
+  const lastSent = user.verification_sent_at ? new Date(user.verification_sent_at) : null;
+  if (lastSent && Date.now() - lastSent.getTime() < RESEND_COOLDOWN_MS) {
+    return res.status(429).json({
+      error: 'Please wait before requesting another verification email.',
+      retry_after_ms: RESEND_COOLDOWN_MS - (Date.now() - lastSent.getTime()),
+    });
+  }
+
+  if (!(await reserveEmailSend(user.email, 'email_verification', RESEND_COOLDOWN_MS))) {
+    return res.status(429).json({
+      error: 'Please wait before requesting another verification email.',
+    });
+  }
+
+  const verificationToken = crypto.randomBytes(32).toString('hex');
+  await db.query(
+    `UPDATE users
+     SET verification_token = $1,
+         verification_sent_at = NOW(),
+         verification_attempts_count = COALESCE(verification_attempts_count, 0) + 1,
+         last_verification_attempt_at = NOW()
+     WHERE id = $2`,
+    [verificationToken, user.id]
+  );
+
+  const verifyUrl = `${getFrontendUrl()}/verify-email?token=${verificationToken}`;
+  Promise.resolve(sendEmail({
+    to: user.email,
+    subject: 'Verify your CrowdPay email address',
+    text: `Hi ${user.name},\n\nHere is your new verification link:\n\n${verifyUrl}\n\nThis link is valid for 24 hours.`,
+    html: `<p>Hi ${user.name},</p><p>Please <a href="${verifyUrl}">verify your email address</a>. This link is valid for 24 hours.</p>`,
+  })).catch((err) => {
+    logger.error('Resend verification email failed', { user_id: user.id, error: err.message });
+  });
+
+  res.json({ message: 'Verification email sent. Please check your inbox.' });
 });
 
 router.post(
@@ -449,7 +653,7 @@ router.post(
   loginLimiter,
   forgotPasswordValidation,
   validateRequestAsError,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const normalizedEmail = req.body.email.trim().toLowerCase();
 
     const { rows } = await db.query(
@@ -457,7 +661,8 @@ router.post(
       [normalizedEmail]
     );
 
-    if (rows.length) {
+    // Silently skip (same response) when the account is in cooldown or the address is suppressed.
+    if (rows.length && await reserveEmailSend(rows[0].email, 'password_reset', PASSWORD_RESET_EMAIL_COOLDOWN_MS)) {
       const user = rows[0];
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = hashToken(rawToken);
@@ -475,7 +680,7 @@ router.post(
       );
 
       const resetUrl = `${getFrontendUrl()}/reset-password?token=${rawToken}`;
-      sendEmail({
+      sendEmailSafe({
         to: user.email,
         subject: 'Reset your CrowdPay password',
         text: `You requested a password reset. Open this link within 1 hour to choose a new password:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
@@ -484,15 +689,14 @@ router.post(
     }
 
     res.json({ message: FORGOT_PASSWORD_MESSAGE });
-  }
-);
+  }));
 
 router.post(
   '/reset-password',
   loginLimiter,
   resetPasswordValidation,
   validateRequestAsError,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const { token, password } = req.body;
     const tokenHash = hashToken(token);
 
@@ -514,10 +718,10 @@ router.post(
     const resetToken = rows[0];
     const passwordHash = await bcrypt.hash(password, 10);
 
-    await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [
-      passwordHash,
-      resetToken.user_id,
-    ]);
+    await db.query(
+      'UPDATE users SET password_hash = $1, token_version = COALESCE(token_version, 0) + 1 WHERE id = $2',
+      [passwordHash, resetToken.user_id]
+    );
     await db.query(
       'UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1',
       [resetToken.id]
@@ -528,8 +732,14 @@ router.post(
       [resetToken.user_id]
     );
 
-    res.json({ message: 'Password reset successfully' });
-  }
+    res.json({ message: 'Password reset successfully. All existing sessions have been invalidated.' });
+  })
 );
 
 module.exports = router;
+module.exports.createRefreshToken = createRefreshToken;
+module.exports.validateRefreshToken = validateRefreshToken;
+module.exports.revokeRefreshToken = revokeRefreshToken;
+module.exports.rotateRefreshToken = rotateRefreshToken;
+module.exports.hashToken = hashToken;
+module.exports.REFRESH_TOKEN_COOKIE_NAME = REFRESH_TOKEN_COOKIE_NAME;

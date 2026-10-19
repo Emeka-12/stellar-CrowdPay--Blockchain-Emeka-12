@@ -3,7 +3,16 @@ const { Keypair } = require('@stellar/stellar-sdk');
 const { getSupportedAssetCodes } = require('../services/stellarService');
 
 const SUPPORTED_ASSETS = getSupportedAssetCodes();
-const VALID_CAMPAIGN_STATUSES = ['active', 'funded', 'closed', 'failed'];
+const VALID_CAMPAIGN_STATUSES = [
+  'active',
+  'funded',
+  'in_progress',
+  'completed',
+  'closed',
+  'withdrawn',
+  'failed',
+  'suspended',
+];
 const VALID_ORDER_BY = ['newest', 'ending_soon', 'most_funded', 'most_backed', 'closest_to_goal', 'trending'];
 const VALID_CATEGORIES = [
   'technology', 'community', 'arts', 'education',
@@ -236,6 +245,13 @@ const contributionValidation = [
     .withMessage('Display name must be at most 50 characters'),
 ];
 
+const updateUserValidation = [
+  body('name')
+    .customSanitizer(stripHtml)
+    .notEmpty()
+    .withMessage('name is required'),
+];
+
 const withdrawalValidation = [
   body('campaign_id')
     .notEmpty()
@@ -307,7 +323,10 @@ function validateRequestAsError(req, res, next) {
 }
 
 module.exports = {
+  VALID_CAMPAIGN_STATUSES,
+  VALID_ORDER_BY,
   registerValidation,
+  updateUserValidation,
   loginValidation,
   forgotPasswordValidation,
   resetPasswordValidation,

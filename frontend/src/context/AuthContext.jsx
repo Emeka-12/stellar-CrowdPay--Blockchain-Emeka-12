@@ -24,8 +24,8 @@ export function AuthProvider({ children }) {
     let active = true;
 
     async function validateAndRefreshUser() {
-      const storedToken = localStorage.getItem('cp_token');
-      if (!storedToken) {
+      // Auth uses an httpOnly cookie; revalidate any cached session against /users/me
+      if (!localStorage.getItem('cp_user')) {
         if (active) {
           setReady(true);
         }
@@ -47,7 +47,7 @@ export function AuthProvider({ children }) {
       } catch (err) {
         if (!active) return;
         // If token is invalid, expired, or user was deleted, silently log out
-        if (err.status === 401 || err.status === 404) {
+        if (err.status === 401 || err.status === 403 || err.status === 404) {
           setUser(null);
           localStorage.removeItem('cp_user');
           localStorage.removeItem('cp_token');

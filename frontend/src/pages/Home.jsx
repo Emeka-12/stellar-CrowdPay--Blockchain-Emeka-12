@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { api } from '../services/api';
@@ -16,12 +16,9 @@ const STATUS_OPTIONS = ['', 'active', 'funded', 'closed', 'failed'];
 const ASSET_OPTIONS = ['', 'USDC', 'XLM'];
 const SORT_OPTIONS = [
   { value: 'newest', key: 'home.newest' },
+  { value: 'trending', key: 'home.trending' },
   { value: 'most_funded', key: 'home.mostFunded' },
   { value: 'closest_to_goal', key: 'home.closestToGoal' },
-  { value: 'newest', label: 'Newest' },
-  { value: 'trending', label: 'Trending' },
-  { value: 'funded', label: 'Most funded' },
-  { value: 'closest_to_goal', label: 'Closest to goal' },
 ];
 const CATEGORY_LABELS = {
   technology: 'Technology',
@@ -94,12 +91,18 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [searchInput, search]);
 
+  const requestIdRef = useRef(0);
+
   useEffect(() => {
+    const requestId = ++requestIdRef.current;
+    const isStale = () => requestId !== requestIdRef.current;
     setListError('');
     setLoading(true);
+    setLoadingMore(false);
     api
       .getCampaigns({ search, status, asset, category, sort, limit: 20, offset: 0 })
       .then((data) => {
+        if (isStale()) return;
         const nextCampaigns = data.campaigns || [];
         const nextTotal = data.total || 0;
         setCampaigns(nextCampaigns);
@@ -107,12 +110,21 @@ export default function Home() {
         setHasMore(nextCampaigns.length < nextTotal);
         setPage(1);
       })
-      .catch((err) => setListError(err.message || t('home.loadingCampaigns')))
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (!isStale()) setListError(err.message || t('home.loadingCampaigns'));
+      })
+      .finally(() => {
+        if (!isStale()) setLoading(false);
+      });
+    return () => {
+      requestIdRef.current += 1;
+    };
   }, [search, status, asset, category, sort]);
 
   async function loadMore() {
     if (loadingMore || !hasMore) return;
+    const requestId = requestIdRef.current;
+    const isStale = () => requestId !== requestIdRef.current;
     setLoadingMore(true);
     setListError('');
     try {
@@ -125,6 +137,7 @@ export default function Home() {
         limit: 20,
         offset: page * 20,
       });
+      if (isStale()) return;
       setCampaigns((prev) => {
         const updated = [...prev, ...next];
         setHasMore(updated.length < nextTotal);
@@ -133,9 +146,9 @@ export default function Home() {
       setTotal(nextTotal);
       setPage((p) => p + 1);
     } catch (err) {
-      setListError(err.message || t('home.loadingCampaigns'));
+      if (!isStale()) setListError(err.message || t('home.loadingCampaigns'));
     } finally {
-      setLoadingMore(false);
+      if (!isStale()) setLoadingMore(false);
     }
   }
 
@@ -307,21 +320,15 @@ export default function Home() {
         ))}
       </div>
 
-      <h2 style={styles.sectionTitle}>Active campaigns</h2>
-
       <div style={styles.sortBar}>
-        {[
-          { value: 'newest',   label: 'Newest' },
-          { value: 'trending', label: '🔥 Trending' },
-          { value: 'funded',   label: 'Most funded' },
-        ].map((opt) => (
+        {SORT_OPTIONS.map((opt) => (
           <button
             key={opt.value}
             type="button"
             className={sort === opt.value ? 'pill-active' : 'pill'}
             onClick={() => handleSortChange(opt.value)}
           >
-            {opt.label}
+            {t(opt.key)}
           </button>
         ))}
       </div>

@@ -29,7 +29,11 @@
     "signup": "Sign up",
     "logout": "Logout",
     "selectLanguage": "Select language",
-    "homeAria": "CrowdPay home"
+    "homeAria": "CrowdPay home",
+    "notificationsAria": "Notifications, {{count}} unread",
+    "notificationsTitle": "Notifications",
+    "markAllRead": "Mark all as read",
+    "noNotifications": "No notifications yet."
   },
   "home": {
     "hero_title": "Fund anything, from anywhere.",
@@ -49,6 +53,7 @@
     "anyStatus": "Any status",
     "anyAsset": "Any asset",
     "newest": "Newest",
+    "trending": "Trending",
     "mostFunded": "Most funded",
     "closestToGoal": "Closest to goal",
     "activeCampaigns": "Active campaigns",

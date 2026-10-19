@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../services/api';
-import { useAuth } from '../context/AuthContext';
 
 const REASONS = [
   { value: 'non_delivery', key: 'dispute.nonDelivery' },
@@ -12,7 +11,6 @@ const REASONS = [
 
 export default function DisputeModal({ campaign, onClose, onSubmitted }) {
   const { t } = useTranslation();
-  const { token } = useAuth();
   const [form, setForm] = useState({ reason: 'non_delivery', description: '', evidence_url: '' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -29,7 +27,6 @@ export default function DisputeModal({ campaign, onClose, onSubmitted }) {
           description: form.description.trim(),
           evidence_url: form.evidence_url.trim() || undefined,
         },
-        token,
       );
       onSubmitted?.();
       onClose();

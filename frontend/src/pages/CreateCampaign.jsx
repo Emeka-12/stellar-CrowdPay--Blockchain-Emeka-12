@@ -46,25 +46,23 @@ function milestonePercentTotal(milestones) {
 
 export default function CreateCampaign() {
   const { t } = useTranslation();
-  const { user, ready, updateUser } = useAuth();
+  const { user, ready, updateUser, token } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [step, setStep] = useState(1);
+  const prefill = location.state?.prefill || {};
   const [form, setForm] = useState({
-    title: location.state?.prefill?.title || '',
-    description: location.state?.prefill?.description || '',
-    target_amount: location.state?.prefill?.target_amount || '',
-    asset_type: location.state?.prefill?.asset_type || 'USDC',
+    title: prefill.title || '',
+    description: prefill.description || '',
+    target_amount: prefill.target_amount || '',
+    asset_type: prefill.asset_type || 'USDC',
     deadline: '',
-    min_contribution: location.state?.prefill?.min_contribution || '',
-    max_contribution: location.state?.prefill?.max_contribution || '',
-    show_backer_amounts: location.state?.prefill?.show_backer_amounts ?? true,
     milestones: [],
-    min_contribution: '',
-    max_contribution: '',
-    max_per_user: '',
-    show_backer_amounts: true,
-    category: '',
+    min_contribution: prefill.min_contribution || '',
+    max_contribution: prefill.max_contribution || '',
+    max_per_user: prefill.max_per_user || '',
+    show_backer_amounts: prefill.show_backer_amounts ?? true,
+    category: prefill.category || '',
   });
   const [coverImageFile, setCoverImageFile] = useState(null);
   const [coverImagePreview, setCoverImagePreview] = useState('');
