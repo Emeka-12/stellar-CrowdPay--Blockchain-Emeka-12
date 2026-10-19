@@ -5,6 +5,7 @@ const { Keypair, TransactionBuilder } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const { networkPassphrase, isTestnet } = require('../config/stellar');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const logger = require('../config/logger');
 const { sendAlert } = require('../services/alerting');
 const { contributionValidation, contributionQuoteValidation, validateRequest } = require('../middleware/validation');
@@ -457,7 +458,7 @@ router.post('/prepare', requireAuth, prepareLimiter, contributionValidation, val
   }
 }));
 
-router.post('/submit-signed', requireAuth, submitSignedLimiter, asyncHandler(async (req, res) => {
+router.post('/submit-signed', requireAuth, submitSignedLimiter, idempotency, asyncHandler(async (req, res) => {
   const { signed_xdr, prepare_token } = req.body;
   if (!signed_xdr || !prepare_token) {
     return res.status(400).json({ error: 'signed_xdr and prepare_token are required' });

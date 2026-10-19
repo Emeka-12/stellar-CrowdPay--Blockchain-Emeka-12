@@ -87,6 +87,7 @@ function buildAuthModule(overrides = {}) {
     '../services/emailService': {
       sendEmail: async () => {},
       sendEmailSafe: async () => {},
+      reserveEmailSend: async () => true,
     },
     '../services/walletSecrets': {
       encryptWalletSecret: async () => 'encrypted-stub',
@@ -286,6 +287,7 @@ function buildHttpApp(opts = {}) {
     '../services/emailService': {
       sendEmail: async () => {},
       sendEmailSafe: async () => {},
+      reserveEmailSend: async () => true,
     },
     '../services/walletSecrets': {
       encryptWalletSecret: async () => 'encrypted-stub',
